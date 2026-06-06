@@ -1,0 +1,91 @@
+<Application
+    x:Class="Switch2ProWirelessViiper.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:Microsoft.UI.Xaml.Controls">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="#F7F7F7" />
+                    <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="#F7F7F7" />
+                    <SolidColorBrush x:Key="NavigationViewTopPaneBackground" Color="#F7F7F7" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackground" Color="Transparent" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundPointerOver" Color="#0A000000" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundPressed" Color="#10000000" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundSelected" Color="#0F000000" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundSelectedPointerOver" Color="#14000000" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundSelectedPressed" Color="#1A000000" />
+                    <SolidColorBrush x:Key="ButtonRevealBackground" Color="Transparent" />
+                    <SolidColorBrush x:Key="ButtonRevealBackgroundPointerOver" Color="#0A000000" />
+                    <SolidColorBrush x:Key="ButtonRevealBackgroundPressed" Color="#10000000" />
+                    <SolidColorBrush x:Key="ButtonRevealBorderBrush" Color="Transparent" />
+                    <SolidColorBrush x:Key="ButtonRevealBorderBrushPointerOver" Color="Transparent" />
+                    <SolidColorBrush x:Key="ButtonRevealBorderBrushPressed" Color="Transparent" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Dark">
+                    <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="#202020" />
+                    <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="#202020" />
+                    <SolidColorBrush x:Key="NavigationViewTopPaneBackground" Color="#202020" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackground" Color="Transparent" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundPointerOver" Color="#14FFFFFF" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundPressed" Color="#1FFFFFFF" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundSelected" Color="#1AFFFFFF" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundSelectedPointerOver" Color="#24FFFFFF" />
+                    <SolidColorBrush x:Key="NavigationViewItemBackgroundSelectedPressed" Color="#2BFFFFFF" />
+                    <SolidColorBrush x:Key="ButtonRevealBackground" Color="Transparent" />
+                    <SolidColorBrush x:Key="ButtonRevealBackgroundPointerOver" Color="#14FFFFFF" />
+                    <SolidColorBrush x:Key="ButtonRevealBackgroundPressed" Color="#1FFFFFFF" />
+                    <SolidColorBrush x:Key="ButtonRevealBorderBrush" Color="Transparent" />
+                    <SolidColorBrush x:Key="ButtonRevealBorderBrushPointerOver" Color="Transparent" />
+                    <SolidColorBrush x:Key="ButtonRevealBorderBrushPressed" Color="Transparent" />
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+                        <Style x:Key="CardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="EnvCardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorSecondaryBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="OnboardingOverlayStyle" TargetType="Grid">
+                <Setter Property="Background" Value="{ThemeResource SolidBackgroundFillColorBaseBrush}" />
+            </Style>
+            <Style x:Key="PrimaryTextStyle" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorPrimaryBrush}" />
+            </Style>
+            <Style x:Key="SecondaryTextStyle" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="TertiaryTextStyle" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorTertiaryBrush}" />
+            </Style>
+            <Style x:Key="SuccessTextStyle" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource SystemFillColorSuccessBrush}" />
+            </Style>
+            <Style x:Key="CriticalTextStyle" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCriticalBrush}" />
+            </Style>
+            <Style x:Key="StatusNeutralStyle" TargetType="Ellipse">
+                <Setter Property="Fill" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="StatusSuccessStyle" TargetType="Ellipse">
+                <Setter Property="Fill" Value="{ThemeResource SystemFillColorSuccessBrush}" />
+            </Style>
+            <Style x:Key="StatusWarningStyle" TargetType="Ellipse">
+                <Setter Property="Fill" Value="{ThemeResource SystemFillColorCautionBrush}" />
+            </Style>
+            <Style x:Key="StatusErrorStyle" TargetType="Ellipse">
+                <Setter Property="Fill" Value="{ThemeResource SystemFillColorCriticalBrush}" />
+            </Style>
+            <Style x:Key="StatusInfoStyle" TargetType="Ellipse">
+                <Setter Property="Fill" Value="{ThemeResource AccentFillColorDefaultBrush}" />
+            </Style>
+            <ResourceDictionary.MergedDictionaries>
+                <controls:XamlControlsResources />
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
+

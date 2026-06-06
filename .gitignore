@@ -1,0 +1,17 @@
+bin/
+obj/
+release/
+
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+*.log
+*.tmp
+*.bak
+
+tools/viiper/viiper.exe
+tools/viiper/*.zip
