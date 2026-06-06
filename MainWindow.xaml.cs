@@ -351,21 +351,36 @@ public sealed partial class MainWindow : Window
             FontFamily = new FontFamily("Segoe Fluent Icons"),
             Glyph = "\uE768",
             FontSize = 18,
-            Margin = new Thickness(0, 0, 10, 0),
+            Width = 24,
+            Height = 24,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
         };
         ConnectButtonText = Text("Connect", 15, Weight(600), null);
-        var connectContent = new StackPanel
+        ConnectButtonText.Width = 64;
+        ConnectButtonText.TextAlignment = TextAlignment.Center;
+        ConnectButtonText.VerticalAlignment = VerticalAlignment.Center;
+        var connectContent = new Grid
         {
-            Orientation = Orientation.Horizontal,
             HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Width = 98,
+            Height = 24,
         };
+        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) });
+        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(10) });
+        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
         connectContent.Children.Add(ConnectGlyph);
+        Grid.SetColumn(ConnectButtonText, 2);
         connectContent.Children.Add(ConnectButtonText);
         ConnectButton = new Button
         {
             Width = 248,
             Height = 56,
             Margin = new Thickness(0, 24, 0, 0),
+            Padding = new Thickness(0),
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center,
             Content = connectContent,
         };
         ApplyStyle(ConnectButton, "AccentButtonStyle");
