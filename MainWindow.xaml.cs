@@ -331,18 +331,25 @@ public sealed partial class MainWindow : Window
         main.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         main.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        var center = new StackPanel
+        var center = new Grid
         {
+            Width = 560,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
         };
+        center.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        center.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        center.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        center.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         main.Children.Add(center);
 
         AppTitleText = Text("Switch 2 Pro", 28, Weight(600), null);
         AppTitleText.HorizontalAlignment = HorizontalAlignment.Center;
+        Grid.SetRow(AppTitleText, 0);
         AppSubtitleText = Text("Wireless VIIPER bridge", 14, Weight(400), null);
         AppSubtitleText.HorizontalAlignment = HorizontalAlignment.Center;
         AppSubtitleText.Margin = new Thickness(0, 8, 0, 0);
+        Grid.SetRow(AppSubtitleText, 1);
         center.Children.Add(AppTitleText);
         center.Children.Add(AppSubtitleText);
 
@@ -376,17 +383,22 @@ public sealed partial class MainWindow : Window
             Height = 56,
             Margin = new Thickness(0, 24, 0, 0),
             Padding = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Center,
             HorizontalContentAlignment = HorizontalAlignment.Center,
             VerticalContentAlignment = VerticalAlignment.Center,
             Content = connectContent,
         };
         ApplyStyle(ConnectButton, "AccentButtonStyle");
         ConnectButton.Click += Connect_Click;
+        Grid.SetRow(ConnectButton, 2);
         center.Children.Add(ConnectButton);
 
         MainHintText = Text("Open menu for setup and diagnostics.", 12, Weight(400), null);
         MainHintText.HorizontalAlignment = HorizontalAlignment.Center;
+        MainHintText.TextAlignment = TextAlignment.Center;
+        MainHintText.TextWrapping = TextWrapping.Wrap;
         MainHintText.Margin = new Thickness(0, 16, 0, 0);
+        Grid.SetRow(MainHintText, 3);
         center.Children.Add(MainHintText);
 
         TrayHintText = Text("Closing the window keeps the bridge in the system tray.", 12, Weight(400), null);
