@@ -357,21 +357,18 @@ public sealed partial class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
         };
         ConnectButtonText = Text("Connect", 15, Weight(600), null);
-        ConnectButtonText.Width = 64;
-        ConnectButtonText.TextAlignment = TextAlignment.Center;
         ConnectButtonText.VerticalAlignment = VerticalAlignment.Center;
+        ConnectButtonText.TextWrapping = TextWrapping.NoWrap;
         var connectContent = new Grid
         {
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
-            Width = 98,
-            Height = 24,
+            ColumnSpacing = 10,
         };
-        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) });
-        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(10) });
-        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
+        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        connectContent.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         connectContent.Children.Add(ConnectGlyph);
-        Grid.SetColumn(ConnectButtonText, 2);
+        Grid.SetColumn(ConnectButtonText, 1);
         connectContent.Children.Add(ConnectButtonText);
         ConnectButton = new Button
         {
