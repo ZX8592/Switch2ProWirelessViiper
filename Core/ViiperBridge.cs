@@ -24,11 +24,14 @@ public sealed class ViiperBridge : IAsyncDisposable
     public event EventHandler<byte[]>? HidOutputReceived;
 
     public string Description { get; }
+    public bool VirtualDeviceReady { get; }
+    public string VirtualDeviceInstanceId { get; }
 
     public static async Task<ViiperServerWarmup> WarmupServerAsync(
         string apiAddress,
         string? viiperExePath,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? trace = null)
     {
         var endpoint = ViiperEndpoint.Parse(string.IsNullOrWhiteSpace(apiAddress) ? "localhost:3242" : apiAddress);
         var api = new ViiperApiClient(endpoint);
@@ -46,7 +49,7 @@ public sealed class ViiperBridge : IAsyncDisposable
                         "VIIPER is not running and viiper.exe was not found. Put viiper.exe beside this app or browse to it.");
                 }
 
-                serverProcess = StartViiperServer(exe, endpoint);
+                serverProcess = StartViiperServer(exe, endpoint, trace);
                 ping = await WaitForPingAsync(api, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
             }
 
@@ -78,7 +81,8 @@ public sealed class ViiperBridge : IAsyncDisposable
         uint busId,
         string devId,
         string serverVersion,
-        ViiperEndpoint endpoint)
+        ViiperEndpoint endpoint,
+        string virtualDeviceInstanceId)
     {
         _api = api;
         _streamClient = streamClient;
@@ -87,14 +91,17 @@ public sealed class ViiperBridge : IAsyncDisposable
         _createdBus = createdBus;
         _busId = busId;
         _devId = devId;
-        Description = $"VIIPER ns2pro {endpoint} v{serverVersion} bus={busId} dev={devId}";
+        VirtualDeviceReady = true;
+        VirtualDeviceInstanceId = virtualDeviceInstanceId;
+        Description = $"VIIPER ns2pro {endpoint} v{serverVersion} bus={busId} dev={devId}, virtual USB ready";
         _readTask = Task.Run(() => ReadLoopAsync(_readCts.Token));
     }
 
     public static async Task<ViiperBridge> ConnectAsync(
         string apiAddress,
         string? viiperExePath,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? trace = null)
     {
         var endpoint = ViiperEndpoint.Parse(string.IsNullOrWhiteSpace(apiAddress) ? "localhost:3242" : apiAddress);
         var api = new ViiperApiClient(endpoint);
@@ -110,7 +117,7 @@ public sealed class ViiperBridge : IAsyncDisposable
                     "VIIPER is not running and viiper.exe was not found. Put viiper.exe beside this app or browse to it.");
             }
 
-            serverProcess = StartViiperServer(exe, endpoint);
+            serverProcess = StartViiperServer(exe, endpoint, trace);
             ping = await WaitForPingAsync(api, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
         }
 
@@ -125,8 +132,26 @@ public sealed class ViiperBridge : IAsyncDisposable
         try
         {
             device = await api.AddNs2ProAsync(busId, cancellationToken).ConfigureAwait(false);
+            trace?.Invoke($"VIIPER created ns2pro device {device.BusId}-{device.DevId}.");
             stream = await api.OpenStreamAsync(device.BusId, device.DevId, cancellationToken).ConfigureAwait(false);
-            return new ViiperBridge(api, stream, serverProcess, createdBus, device.BusId, device.DevId, ping.Version ?? "unknown", endpoint);
+            trace?.Invoke($"VIIPER ns2pro stream opened for {device.BusId}-{device.DevId}.");
+            var virtualDeviceInstanceId = await UsbipVirtualController.EnsureAttachedAsync(
+                    endpoint.Host,
+                    device.BusId,
+                    device.DevId,
+                    trace,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return new ViiperBridge(
+                api,
+                stream,
+                serverProcess,
+                createdBus,
+                device.BusId,
+                device.DevId,
+                ping.Version ?? "unknown",
+                endpoint,
+                virtualDeviceInstanceId);
         }
         catch
         {
@@ -313,7 +338,10 @@ public sealed class ViiperBridge : IAsyncDisposable
             .FirstOrDefault(File.Exists);
     }
 
-    private static Process StartViiperServer(string exePath, ViiperEndpoint endpoint)
+    private static Process StartViiperServer(
+        string exePath,
+        ViiperEndpoint endpoint,
+        Action<string>? trace)
     {
         var info = new ProcessStartInfo
         {
@@ -322,10 +350,37 @@ public sealed class ViiperBridge : IAsyncDisposable
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
         };
+        var process = new Process
+        {
+            StartInfo = info,
+            EnableRaisingEvents = true,
+        };
+        process.OutputDataReceived += (_, args) =>
+        {
+            if (!string.IsNullOrWhiteSpace(args.Data))
+            {
+                trace?.Invoke("VIIPER: " + args.Data);
+            }
+        };
+        process.ErrorDataReceived += (_, args) =>
+        {
+            if (!string.IsNullOrWhiteSpace(args.Data))
+            {
+                trace?.Invoke("VIIPER error: " + args.Data);
+            }
+        };
+        if (!process.Start())
+        {
+            process.Dispose();
+            throw new InvalidOperationException($"Failed to start VIIPER server: {exePath}");
+        }
 
-        return Process.Start(info)
-            ?? throw new InvalidOperationException($"Failed to start VIIPER server: {exePath}");
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        return process;
     }
 
     private static async Task TryCleanupDeviceAsync(ViiperApiClient api, uint busId, string devId)

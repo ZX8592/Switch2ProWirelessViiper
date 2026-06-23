@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.IO;
 using System.Globalization;
+using System.Net;
 using System.Runtime;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -25,6 +26,7 @@ namespace Switch2ProWirelessViiper;
 public sealed partial class MainWindow : Window
 {
     private const int MaxLogCharacters = 64 * 1024;
+    private const long MaxDiagnosticLogBytes = 2 * 1024 * 1024;
 
     private readonly BleScanner _scanner = new();
     private readonly Fd2ReportParser _parser = new();
@@ -104,6 +106,9 @@ public sealed partial class MainWindow : Window
     private TextBlock ConfigPathLabel = null!;
     private TextBlock ConfigPathText = null!;
     private Button OpenConfigFolderButton = null!;
+    private TextBlock FeedbackTitleText = null!;
+    private TextBlock FeedbackDescriptionText = null!;
+    private Button FeedbackButton = null!;
     private Button ClearLogButton = null!;
     private Grid OnboardingOverlay = null!;
     private TextBlock OnboardingTitleText = null!;
@@ -166,6 +171,9 @@ public sealed partial class MainWindow : Window
     private long _maxBridgeLatencyTicks;
     private long _stateVersion;
     private long _lastStateNotificationTicks;
+    private long _rawInputNotifications;
+    private long _rejectedInputNotifications;
+    private long _lastPerformanceLogTicks;
     private long _lastParsedRateSample;
     private long _lastSubmittedRateSample;
     private long _lastRateSampleTicks = Stopwatch.GetTimestamp();
@@ -178,6 +186,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         BuildUi();
+        _scanner.Trace += (_, message) => RunOnUi(() => Log(message));
         _menuPanels =
         [
             HomePanel,
@@ -189,6 +198,7 @@ public sealed partial class MainWindow : Window
         ];
 
         _settings = AppSettings.Load();
+        InitializeDiagnosticLog();
         _parser.ApplyStickCalibration(_settings.StickCalibration);
         ShouldStartToTray = ShouldLaunchToTray(_settings);
         ConfigureWindow();
@@ -259,6 +269,7 @@ public sealed partial class MainWindow : Window
         };
 
         Log("Ready. This app only uses BLE + VIIPER ns2pro.");
+        LogStartupDiagnostics();
     }
 
     private static bool ShouldLaunchToTray(AppSettings settings)
@@ -355,7 +366,7 @@ public sealed partial class MainWindow : Window
 
         ConnectGlyph = new FontIcon
         {
-            FontFamily = new FontFamily("Segoe Fluent Icons"),
+            FontFamily = SymbolIconFontFamily(),
             Glyph = "\uE768",
             FontSize = 18,
             Width = 24,
@@ -652,6 +663,28 @@ public sealed partial class MainWindow : Window
         stack.Children.Add(OpenConfigFolderButton);
         card.Child = stack;
         root.Children.Add(card);
+
+        var feedbackCard = Card();
+        var feedbackStack = new StackPanel { Spacing = 8 };
+        FeedbackTitleText = Text("Feedback", 18, Weight(600), null);
+        FeedbackDescriptionText = Text(
+            "Send a problem report or suggestion.",
+            13,
+            Weight(400),
+            UiBrush(Color(0x60, 0x60, 0x60)));
+        FeedbackDescriptionText.TextWrapping = TextWrapping.Wrap;
+        FeedbackButton = new Button
+        {
+            Content = "Send feedback",
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Margin = new Thickness(0, 8, 0, 0),
+        };
+        FeedbackButton.Click += FeedbackButton_Click;
+        feedbackStack.Children.Add(FeedbackTitleText);
+        feedbackStack.Children.Add(FeedbackDescriptionText);
+        feedbackStack.Children.Add(FeedbackButton);
+        feedbackCard.Child = feedbackStack;
+        root.Children.Add(feedbackCard);
         return root;
     }
 
@@ -794,7 +827,7 @@ public sealed partial class MainWindow : Window
             Height = 40,
             Content = new FontIcon
             {
-                FontFamily = new FontFamily("Segoe Fluent Icons"),
+                FontFamily = SymbolIconFontFamily(),
                 Glyph = glyph,
                 FontSize = 16,
             },
@@ -811,10 +844,34 @@ public sealed partial class MainWindow : Window
             Tag = tag,
             Icon = new FontIcon
             {
-                FontFamily = new FontFamily("Segoe Fluent Icons"),
+                FontFamily = SymbolIconFontFamily(),
                 Glyph = glyph,
             }
         };
+    }
+
+    private static FontFamily SymbolIconFontFamily()
+    {
+        try
+        {
+            if (Application.Current?.Resources.TryGetValue("SymbolThemeFontFamily", out var value) == true)
+            {
+                if (value is FontFamily fontFamily)
+                {
+                    return fontFamily;
+                }
+
+                if (value is string source && !string.IsNullOrWhiteSpace(source))
+                {
+                    return new FontFamily(source);
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return new FontFamily("Segoe MDL2 Assets");
     }
 
     private static void SetNavItemText(NavigationViewItem item, string text)
@@ -1312,7 +1369,8 @@ _settings.Save();
             var warmup = await ViiperBridge.WarmupServerAsync(
                     ViiperAddressBox.Text.Trim(),
                     string.IsNullOrWhiteSpace(ViiperExeBox.Text) ? null : ViiperExeBox.Text.Trim(),
-                    cancellationToken)
+                    cancellationToken,
+                    message => RunOnUi(() => Log(message)))
                 .ConfigureAwait(false);
 
             var old = _viiperWarmup;
@@ -1500,6 +1558,9 @@ _settings.Save();
         UpdateTrayMenu();
         ConfigPathText.Text = AppSettings.SettingsPath;
         OpenConfigFolderButton.Content = T("openFolder");
+        FeedbackTitleText.Text = T("feedbackTitle");
+        FeedbackDescriptionText.Text = T("feedbackDescription");
+        FeedbackButton.Content = T("feedbackButton");
         ClearLogButton.Content = T("clear");
         OnboardingTitleText.Text = T("onboardingTitle");
         UpdateOnboardingStepUi();
@@ -1623,6 +1684,25 @@ _settings.Save();
                 "autoDisconnect" => "闲置后自动断开 (分钟，0 表示禁用)",
                 "configFile" => "配置文件",
                 "openFolder" => "打开目录",
+                "feedbackTitle" => "用户反馈",
+                "feedbackDescription" => "发送问题报告或建议，并可选择附带诊断日志。",
+                "feedbackButton" => "提交反馈",
+                "feedbackDialogTitle" => "用户反馈",
+                "feedbackMessage" => "反馈内容",
+                "feedbackPlaceholder" => "请描述问题发生前后的操作、实际结果和预期结果。",
+                "feedbackIncludeDiagnostics" => "附带诊断日志（不包含配置文件）",
+                "feedbackPrivacyHint" => "诊断日志可能包含蓝牙设备标识和本地路径。取消勾选时只发送基础系统信息。",
+                "feedbackSend" => "发送",
+                "feedbackCancel" => "取消",
+                "feedbackClose" => "关闭",
+                "feedbackSending" => "正在发送，邮件服务器响应可能需要一些时间...",
+                "feedbackSuccessFormat" => "反馈已发送。请求编号：{0}",
+                "feedbackInvalid" => "反馈内容为空或超过 32 KiB 限制。",
+                "feedbackBadRequest" => "反馈内容或诊断附件格式不符合接口要求。",
+                "feedbackTooLarge" => "反馈内容或诊断附件超过大小限制。",
+                "feedbackRateLimited" => "发送次数过多，请稍后再试。",
+                "feedbackUnavailable" => "反馈服务暂时不可用，请稍后再试。",
+                "feedbackFailedFormat" => "发送失败：{0}",
                 "browse" => "浏览",
                 "clear" => "清空",
                 "loadingViiper" => "正在加载 VIIPER...",
@@ -1744,6 +1824,25 @@ _settings.Save();
                 "autoDisconnect" => "アイドル後に自動切断 (分、0 で無効)",
                 "configFile" => "設定ファイル",
                 "openFolder" => "フォルダーを開く",
+                "feedbackTitle" => "フィードバック",
+                "feedbackDescription" => "問題の報告や提案を送信し、必要に応じて診断ログを添付できます。",
+                "feedbackButton" => "フィードバックを送信",
+                "feedbackDialogTitle" => "フィードバック",
+                "feedbackMessage" => "内容",
+                "feedbackPlaceholder" => "問題が発生する前後の操作、実際の結果、期待する結果を入力してください。",
+                "feedbackIncludeDiagnostics" => "診断ログを添付する（設定ファイルは含みません）",
+                "feedbackPrivacyHint" => "診断ログには Bluetooth デバイス識別子やローカルパスが含まれる場合があります。オフにすると基本的なシステム情報のみ送信します。",
+                "feedbackSend" => "送信",
+                "feedbackCancel" => "キャンセル",
+                "feedbackClose" => "閉じる",
+                "feedbackSending" => "送信中です。メールサーバーの応答に時間がかかる場合があります...",
+                "feedbackSuccessFormat" => "フィードバックを送信しました。リクエスト ID: {0}",
+                "feedbackInvalid" => "内容が空か、32 KiB の上限を超えています。",
+                "feedbackBadRequest" => "内容または診断ファイルの形式が正しくありません。",
+                "feedbackTooLarge" => "内容または診断ファイルがサイズ上限を超えています。",
+                "feedbackRateLimited" => "送信回数が多すぎます。しばらくしてから再試行してください。",
+                "feedbackUnavailable" => "フィードバックサービスを一時的に利用できません。後でもう一度お試しください。",
+                "feedbackFailedFormat" => "送信に失敗しました: {0}",
                 "browse" => "参照",
                 "clear" => "クリア",
                 "loadingViiper" => "VIIPER を読み込み中...",
@@ -1863,6 +1962,25 @@ _settings.Save();
             "autoDisconnect" => "Auto disconnect (idle minutes, 0=off)",
             "configFile" => "Config file",
             "openFolder" => "Open folder",
+            "feedbackTitle" => "Feedback",
+            "feedbackDescription" => "Send a problem report or suggestion, with optional diagnostic logs.",
+            "feedbackButton" => "Send feedback",
+            "feedbackDialogTitle" => "Feedback",
+            "feedbackMessage" => "Feedback",
+            "feedbackPlaceholder" => "Describe what you did, what happened, and what you expected.",
+            "feedbackIncludeDiagnostics" => "Include diagnostic logs (settings are never included)",
+            "feedbackPrivacyHint" => "Diagnostic logs may contain Bluetooth device identifiers and local paths. Clear this option to send only basic system information.",
+            "feedbackSend" => "Send",
+            "feedbackCancel" => "Cancel",
+            "feedbackClose" => "Close",
+            "feedbackSending" => "Sending. The mail server may take a little while to respond...",
+            "feedbackSuccessFormat" => "Feedback sent. Request ID: {0}",
+            "feedbackInvalid" => "Feedback is empty or exceeds the 32 KiB limit.",
+            "feedbackBadRequest" => "The feedback or diagnostic attachment format was rejected.",
+            "feedbackTooLarge" => "The feedback or diagnostic attachment exceeds the size limit.",
+            "feedbackRateLimited" => "Too many submissions. Please try again later.",
+            "feedbackUnavailable" => "The feedback service is temporarily unavailable. Please try again later.",
+            "feedbackFailedFormat" => "Could not send feedback: {0}",
             "browse" => "Browse",
             "clear" => "Clear",
             "loadingViiper" => "Loading VIIPER...",
@@ -2060,9 +2178,11 @@ _settings.Save();
     private async Task ScanToComboAsync(ComboBox candidatesBox, TextBox secondsBox, TextBox addressBox)
     {
         SetStatus(T("statusScanning"), StatusBrush("info"));
+        ScanButton.IsEnabled = false;
         candidatesBox.ItemsSource = null;
         try
         {
+            await Task.Yield();
             var seconds = int.TryParse(secondsBox.Text, out var parsed) ? Math.Clamp(parsed, 1, 60) : 12;
             Log($"Scanning for Nintendo BLE candidates for {seconds}s...");
             var candidates = await _scanner.ScanAsync(TimeSpan.FromSeconds(seconds), CancellationToken.None);
@@ -2082,6 +2202,10 @@ _settings.Save();
         {
             Log("Scan failed: " + ex.Message);
             SetStatus(T("statusScanFailed"), StatusBrush("error"));
+        }
+        finally
+        {
+            ScanButton.IsEnabled = true;
         }
     }
 
@@ -2112,7 +2236,12 @@ _settings.Save();
             _viiper = await ViiperBridge.ConnectAsync(
                 ViiperAddressBox.Text.Trim(),
                 string.IsNullOrWhiteSpace(ViiperExeBox.Text) ? null : ViiperExeBox.Text.Trim(),
-                CancellationToken.None);
+                CancellationToken.None,
+                message => RunOnUi(() => Log(message)));
+            if (!_viiper.VirtualDeviceReady)
+            {
+                throw new InvalidOperationException("VIIPER did not confirm the virtual USB controller.");
+            }
             _viiper.HidOutputReceived += OnViiperHidOutput;
             ViiperStatusText.Text = _viiper.Description;
             Log("VIIPER ready: " + _viiper.Description);
@@ -2120,6 +2249,7 @@ _settings.Save();
         }
         catch (Exception ex)
         {
+            ViiperStatusText.Text = ex.Message;
             Log("VIIPER load failed: " + ex.Message);
             SetStatus(T("statusConnectFailed"), StatusBrush("error"));
         }
@@ -2131,6 +2261,14 @@ _settings.Save();
 
     private async Task ConnectBleAsync()
     {
+        if (_viiper?.VirtualDeviceReady != true)
+        {
+            ViiperStatusText.Text = "Virtual USB controller is not ready.";
+            Log("BLE connection blocked: virtual USB controller is not ready.");
+            SetStatus(T("statusConnectFailed"), StatusBrush("error"));
+            return;
+        }
+
         if (!TryParseAddress(out var address))
         {
             Log("Enter or scan a 12-digit BLE address first.");
@@ -2155,6 +2293,7 @@ _settings.Save();
                     TaskScheduler.Default);
 
             SetStatus(T("statusConnectingBle"), StatusBrush("warning"));
+            await _scanner.LogEnvironmentAsync(_sessionCts.Token);
             _ble = new BleClient();
             _ble.Trace += (_, message) => RunOnUi(() => Log(message));
             _ble.LinkDiagnosticsChanged += OnBleLinkDiagnosticsChanged;
@@ -2172,7 +2311,12 @@ _settings.Save();
         }
         catch (Exception ex)
         {
-            Log("Connect failed: " + ex.Message);
+            Log(
+                $"Connect failed: {ex.GetType().FullName}: {ex.Message} " +
+                $"(HRESULT 0x{ex.HResult:X8})" +
+                (ex.InnerException is null
+                    ? string.Empty
+                    : $"; inner={ex.InnerException.GetType().FullName}: {ex.InnerException.Message}"));
             await DisconnectAsync().ConfigureAwait(true);
             SetStatus(T("statusConnectFailed"), StatusBrush("error"));
             UpdateConnectionUi();
@@ -2261,6 +2405,13 @@ _settings.Save();
     private void OnBleNotification(object? sender, BleNotificationEventArgs args)
     {
         var notificationTicks = Stopwatch.GetTimestamp();
+        var isInput = args.CharacteristicUuid.Equals(BleClient.InputReportUuid, StringComparison.OrdinalIgnoreCase) ||
+                      args.CharacteristicUuid.Equals(Fd2ReportParser.LegacyNotifyUuid, StringComparison.OrdinalIgnoreCase);
+        if (isInput)
+        {
+            Interlocked.Increment(ref _rawInputNotifications);
+        }
+
         try
         {
             var parsed = false;
@@ -2290,6 +2441,10 @@ _settings.Save();
 
             if (!parsed)
             {
+                if (isInput)
+                {
+                    Interlocked.Increment(ref _rejectedInputNotifications);
+                }
                 return;
             }
 
@@ -2532,6 +2687,170 @@ _settings.Save();
         }
     }
 
+    private async void FeedbackButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (RootGrid.XamlRoot is null)
+        {
+            return;
+        }
+
+        var feedbackBox = new TextBox
+        {
+            Header = T("feedbackMessage"),
+            PlaceholderText = T("feedbackPlaceholder"),
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            MinHeight = 150,
+            MaxHeight = 280,
+            MaxLength = 32768,
+        };
+        var includeDiagnostics = new CheckBox
+        {
+            Content = T("feedbackIncludeDiagnostics"),
+            IsChecked = true,
+        };
+        var privacyHint = Text(
+            T("feedbackPrivacyHint"),
+            12,
+            Weight(400),
+            UiBrush(Color(0x60, 0x60, 0x60)));
+        privacyHint.TextWrapping = TextWrapping.Wrap;
+        var status = new InfoBar
+        {
+            IsOpen = false,
+            IsClosable = false,
+        };
+        var content = new StackPanel
+        {
+            Spacing = 12,
+            MinWidth = 360,
+            MaxWidth = 520,
+        };
+        content.Children.Add(feedbackBox);
+        content.Children.Add(includeDiagnostics);
+        content.Children.Add(privacyHint);
+        content.Children.Add(status);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = RootGrid.XamlRoot,
+            Title = T("feedbackDialogTitle"),
+            Content = content,
+            PrimaryButtonText = T("feedbackSend"),
+            CloseButtonText = T("feedbackCancel"),
+            DefaultButton = ContentDialogButton.Primary,
+            IsPrimaryButtonEnabled = false,
+        };
+
+        var sent = false;
+        var sending = false;
+        feedbackBox.TextChanged += (_, _) =>
+        {
+            if (!sent && !sending)
+            {
+                dialog.IsPrimaryButtonEnabled = !string.IsNullOrWhiteSpace(feedbackBox.Text);
+            }
+        };
+        dialog.PrimaryButtonClick += async (_, args) =>
+        {
+            if (sent)
+            {
+                return;
+            }
+
+            args.Cancel = true;
+            if (sending)
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(feedbackBox.Text))
+            {
+                status.Severity = InfoBarSeverity.Warning;
+                status.Message = T("feedbackInvalid");
+                status.IsOpen = true;
+                return;
+            }
+
+            var deferral = args.GetDeferral();
+            sending = true;
+            dialog.IsPrimaryButtonEnabled = false;
+            feedbackBox.IsEnabled = false;
+            includeDiagnostics.IsEnabled = false;
+            status.Severity = InfoBarSeverity.Informational;
+            status.Message = T("feedbackSending");
+            status.IsOpen = true;
+            try
+            {
+                var result = await FeedbackClient.SubmitAsync(
+                    feedbackBox.Text,
+                    includeDiagnostics.IsChecked == true,
+                    SelectedLanguage(LanguageCombo),
+                    message => RunOnUi(() => Log(message)),
+                    CancellationToken.None);
+                sent = true;
+                status.Severity = InfoBarSeverity.Success;
+                status.Message = string.Format(T("feedbackSuccessFormat"), result.RequestId);
+                dialog.PrimaryButtonText = T("feedbackClose");
+                dialog.CloseButtonText = string.Empty;
+                dialog.IsPrimaryButtonEnabled = true;
+            }
+            catch (Exception ex)
+            {
+                Log(
+                    $"Feedback submission failed: {ex.GetType().FullName}: {ex.Message} " +
+                    $"(HRESULT 0x{ex.HResult:X8}).");
+                status.Severity = InfoBarSeverity.Error;
+                status.Message = FormatFeedbackError(ex);
+                feedbackBox.IsEnabled = true;
+                includeDiagnostics.IsEnabled = true;
+                dialog.IsPrimaryButtonEnabled = true;
+            }
+            finally
+            {
+                sending = false;
+                deferral.Complete();
+            }
+        };
+
+        FeedbackButton.IsEnabled = false;
+        try
+        {
+            await dialog.ShowAsync();
+        }
+        finally
+        {
+            FeedbackButton.IsEnabled = true;
+        }
+    }
+
+    private string FormatFeedbackError(Exception exception)
+    {
+        if (exception is ArgumentException or InvalidOperationException)
+        {
+            return T("feedbackInvalid");
+        }
+
+        if (exception is FeedbackSubmissionException feedbackException)
+        {
+            return feedbackException.StatusCode switch
+            {
+                HttpStatusCode.BadRequest or HttpStatusCode.UnsupportedMediaType => T("feedbackBadRequest"),
+                HttpStatusCode.RequestEntityTooLarge => T("feedbackTooLarge"),
+                HttpStatusCode.TooManyRequests => T("feedbackRateLimited"),
+                HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout => T("feedbackUnavailable"),
+                _ => string.Format(T("feedbackFailedFormat"), $"HTTP {(int)feedbackException.StatusCode}"),
+            };
+        }
+
+        if (exception is HttpRequestException or TaskCanceledException)
+        {
+            return T("feedbackUnavailable");
+        }
+
+        return string.Format(T("feedbackFailedFormat"), exception.Message);
+    }
+
     private void OnBleStatusChanged(object? sender, BluetoothConnectionStatus status)
     {
         RunOnUi(() =>
@@ -2735,6 +3054,21 @@ _settings.Save();
             ? StatusBrush("success")
             : StatusBrush("warning");
         BacklogText.Foreground = backlog == 0 && errors == 0 ? StatusBrush("success") : StatusBrush("error");
+
+        var lastPerformanceLogTicks = Volatile.Read(ref _lastPerformanceLogTicks);
+        if (IsBleConnected && nowTicks - lastPerformanceLogTicks >= Stopwatch.Frequency * 5L &&
+            Interlocked.CompareExchange(ref _lastPerformanceLogTicks, nowTicks, lastPerformanceLogTicks) == lastPerformanceLogTicks)
+        {
+            var rawInput = Interlocked.Read(ref _rawInputNotifications);
+            var rejectedInput = Interlocked.Read(ref _rejectedInputNotifications);
+            var inputAgeMs = lastFrameTicks > 0 ? TicksToMilliseconds(nowTicks - lastFrameTicks) : -1;
+            Log(
+                $"Pipeline diagnostics: rawInput={rawInput}, parsed={parsed}, rejected={rejectedInput}, " +
+                $"submitted={submitted}, submitErrors={errors}, currentRate={_bleRateHz:F1}/{_submitRateHz:F1} Hz, " +
+                $"averageRate={averageBleRate:F1}/{averageSubmitRate:F1} Hz, " +
+                $"lastParsedIntervalMs={(interReportTicks > 0 ? TicksToMilliseconds(interReportTicks).ToString("F2", CultureInfo.InvariantCulture) : "n/a")}, " +
+                $"inputAgeMs={(inputAgeMs >= 0 ? inputAgeMs.ToString("F1", CultureInfo.InvariantCulture) : "n/a")}.");
+        }
     }
 
     private void UpdateRumbleView()
@@ -2760,6 +3094,9 @@ _settings.Save();
         Interlocked.Exchange(ref _maxBridgeLatencyTicks, 0);
         Interlocked.Exchange(ref _stateVersion, 0);
         Interlocked.Exchange(ref _lastStateNotificationTicks, 0);
+        Interlocked.Exchange(ref _rawInputNotifications, 0);
+        Interlocked.Exchange(ref _rejectedInputNotifications, 0);
+        Interlocked.Exchange(ref _lastPerformanceLogTicks, Stopwatch.GetTimestamp());
         Interlocked.Exchange(ref _submitSignalPending, 0);
         while (_submitSignal.Wait(0))
         {
@@ -2918,6 +3255,80 @@ _settings.Save();
         if (!_isHiddenToTray)
         {
             SyncLogBox();
+        }
+
+        try
+        {
+            File.AppendAllText(DiagnosticLogPath, line, Encoding.UTF8);
+        }
+        catch
+        {
+        }
+    }
+
+    private static string DiagnosticLogPath =>
+        Path.Combine(
+            Path.GetDirectoryName(AppSettings.SettingsPath) ?? AppContext.BaseDirectory,
+            "diagnostics.log");
+
+    private static void InitializeDiagnosticLog()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(DiagnosticLogPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            if (File.Exists(DiagnosticLogPath) && new FileInfo(DiagnosticLogPath).Length >= MaxDiagnosticLogBytes)
+            {
+                var previousPath = Path.Combine(directory ?? AppContext.BaseDirectory, "diagnostics.previous.log");
+                File.Move(DiagnosticLogPath, previousPath, overwrite: true);
+            }
+
+            File.AppendAllText(
+                DiagnosticLogPath,
+                $"{Environment.NewLine}===== session {DateTimeOffset.Now:O} ====={Environment.NewLine}",
+                Encoding.UTF8);
+        }
+        catch
+        {
+        }
+    }
+
+    private void LogStartupDiagnostics()
+    {
+        var assemblyVersion = typeof(MainWindow).Assembly.GetName().Version?.ToString() ?? "unknown";
+        Log(
+            $"Runtime environment: appVersion={assemblyVersion}, OS='{RuntimeInformation.OSDescription}', " +
+            $"framework='{RuntimeInformation.FrameworkDescription}', processArch={RuntimeInformation.ProcessArchitecture}, " +
+            $"osArch={RuntimeInformation.OSArchitecture}, culture={CultureInfo.CurrentCulture.Name}, " +
+            $"uiCulture={CultureInfo.CurrentUICulture.Name}, elevated={IsProcessElevated()}.");
+        Log($"Diagnostic log file: '{DiagnosticLogPath}'.");
+
+        object? symbolThemeFont = null;
+        var hasSymbolThemeFont = Application.Current?.Resources.TryGetValue("SymbolThemeFontFamily", out symbolThemeFont) == true;
+        var navFont = (HomeNavItem.Icon as FontIcon)?.FontFamily?.Source ?? "n/a";
+        var windowsFonts = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Fonts");
+        Log(
+            $"Icon diagnostics: SymbolThemeFontFamily present={hasSymbolThemeFont}, " +
+            $"resource='{symbolThemeFont ?? "n/a"}', navFont='{navFont}', " +
+            $"SegoeIcons.ttf={File.Exists(Path.Combine(windowsFonts, "SegoeIcons.ttf"))}, " +
+            $"segmdl2.ttf={File.Exists(Path.Combine(windowsFonts, "segmdl2.ttf"))}.");
+    }
+
+    private static bool IsProcessElevated()
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
         }
     }
 

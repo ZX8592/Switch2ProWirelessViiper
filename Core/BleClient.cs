@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Storage.Streams;
@@ -20,7 +21,20 @@ public sealed class BleClient : IAsyncDisposable
     private GattCharacteristic? _rumbleCharacteristic;
     private readonly List<GattDeviceService> _services = new();
     private readonly object _ackLock = new();
+    private readonly object _notificationDiagnosticsLock = new();
     private TaskCompletionSource<byte[]>? _pendingAck;
+    private long _notificationWindowStartedTicks = Stopwatch.GetTimestamp();
+    private long _inputNotifications;
+    private long _ackNotifications;
+    private long _otherNotifications;
+    private long _inputBytes;
+    private long _inputIntervalTicks;
+    private long _inputIntervalSamples;
+    private long _lastInputNotificationTicks;
+    private long _minimumInputIntervalTicks = long.MaxValue;
+    private long _maximumInputIntervalTicks;
+    private int _minimumInputSize = int.MaxValue;
+    private int _maximumInputSize;
 
     public event EventHandler<BleNotificationEventArgs>? NotificationReceived;
     public event EventHandler<BluetoothConnectionStatus>? ConnectionStatusChanged;
@@ -40,6 +54,11 @@ public sealed class BleClient : IAsyncDisposable
             throw new InvalidOperationException($"Could not connect to BLE device {bluetoothAddress:X12}.");
         }
 
+        Trace?.Invoke(
+            this,
+            $"BLE device opened: name='{_device.Name}', address={_device.BluetoothAddress:X12}, " +
+            $"status={_device.ConnectionStatus}, paired={_device.DeviceInformation.Pairing.IsPaired}, " +
+            $"id='{_device.DeviceInformation.Id}'.");
         _device.ConnectionStatusChanged += OnConnectionStatusChanged;
         ReassertLowLatencyConnectionParameters("device-open");
         await OpenGattSessionAsync(cancellationToken).ConfigureAwait(false);
@@ -151,9 +170,11 @@ public sealed class BleClient : IAsyncDisposable
 
         if (servicesResult.Status != GattCommunicationStatus.Success)
         {
-            throw new InvalidOperationException($"GATT service discovery failed: {servicesResult.Status}");
+            throw new InvalidOperationException(
+                $"GATT service discovery failed: {servicesResult.Status}, protocolError={servicesResult.ProtocolError?.ToString() ?? "none"}");
         }
 
+        Trace?.Invoke(this, $"GATT service discovery returned {servicesResult.Services.Count} service(s).");
         foreach (var service in servicesResult.Services)
         {
             _services.Add(service);
@@ -163,6 +184,10 @@ public sealed class BleClient : IAsyncDisposable
 
             if (characteristicsResult.Status != GattCommunicationStatus.Success)
             {
+                Trace?.Invoke(
+                    this,
+                    $"GATT characteristic discovery skipped service {service.Uuid}: " +
+                    $"status={characteristicsResult.Status}, protocolError={characteristicsResult.ProtocolError?.ToString() ?? "none"}.");
                 continue;
             }
 
@@ -194,7 +219,12 @@ public sealed class BleClient : IAsyncDisposable
                 $"Required GATT characteristics were not found. Input={_inputCharacteristic is not null}, Write={_writeCharacteristic is not null}");
         }
 
-        Trace?.Invoke(this, $"GATT ready input={_inputCharacteristic.Uuid} cmd={_writeCharacteristic.Uuid} rumble={_rumbleCharacteristic?.Uuid.ToString() ?? "none"}");
+        Trace?.Invoke(
+            this,
+            $"GATT ready input={DescribeCharacteristic(_inputCharacteristic)}, " +
+            $"ack={DescribeCharacteristic(_ackCharacteristic)}, " +
+            $"cmd={DescribeCharacteristic(_writeCharacteristic)}, " +
+            $"rumble={DescribeCharacteristic(_rumbleCharacteristic)}.");
     }
 
     private async Task OpenGattSessionAsync(CancellationToken cancellationToken)
@@ -302,12 +332,27 @@ public sealed class BleClient : IAsyncDisposable
                 }
             }
 
-            Trace?.Invoke(this, $"BLE init {i + 1}/{commands.Length} {command.Name}");
+            Trace?.Invoke(this, $"BLE init {i + 1}/{commands.Length} {command.Name}: write {command.Data.Length} bytes.");
+            var commandStarted = Stopwatch.GetTimestamp();
             await WriteCommandAsync(command.Data, cancellationToken).ConfigureAwait(false);
 
             if (ackTcs is not null)
             {
-                await Task.WhenAny(ackTcs.Task, Task.Delay(250, cancellationToken)).ConfigureAwait(false);
+                var completed = await Task.WhenAny(ackTcs.Task, Task.Delay(250, cancellationToken)).ConfigureAwait(false);
+                var elapsedMs = Stopwatch.GetElapsedTime(commandStarted).TotalMilliseconds;
+                if (completed == ackTcs.Task && ackTcs.Task.IsCompletedSuccessfully)
+                {
+                    var ack = await ackTcs.Task.ConfigureAwait(false);
+                    Trace?.Invoke(
+                        this,
+                        $"BLE init {command.Name}: ACK received in {elapsedMs:F1} ms, " +
+                        $"length={ack.Length}, data={FormatHexPrefix(ack)}.");
+                }
+                else
+                {
+                    Trace?.Invoke(this, $"BLE init {command.Name}: ACK timeout after {elapsedMs:F1} ms.");
+                }
+
                 lock (_ackLock)
                 {
                     if (ReferenceEquals(_pendingAck, ackTcs))
@@ -344,6 +389,7 @@ public sealed class BleClient : IAsyncDisposable
         var option = characteristic.CharacteristicProperties.HasFlag(GattCharacteristicProperties.WriteWithoutResponse)
             ? GattWriteOption.WriteWithoutResponse
             : GattWriteOption.WriteWithResponse;
+        var started = Stopwatch.GetTimestamp();
         var status = await characteristic
             .WriteValueAsync(writer.DetachBuffer(), option)
             .AsTask(cancellationToken)
@@ -351,14 +397,18 @@ public sealed class BleClient : IAsyncDisposable
 
         if (status != GattCommunicationStatus.Success)
         {
-            throw new InvalidOperationException($"BLE {purpose} write failed: {status}");
+            throw new InvalidOperationException(
+                $"BLE {purpose} write failed: status={status}, option={option}, " +
+                $"length={data.Length}, elapsed={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} ms");
         }
     }
 
     private void OnValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)
     {
         var data = BleScanner.ReadBytes(args.CharacteristicValue);
-        if (sender.Uuid.ToString().Equals(AckReportUuid, StringComparison.OrdinalIgnoreCase))
+        var uuid = sender.Uuid.ToString();
+        RecordNotificationDiagnostics(uuid, data.Length);
+        if (uuid.Equals(AckReportUuid, StringComparison.OrdinalIgnoreCase))
         {
             lock (_ackLock)
             {
@@ -368,11 +418,12 @@ public sealed class BleClient : IAsyncDisposable
 
         NotificationReceived?.Invoke(
             this,
-            new BleNotificationEventArgs(sender.Uuid.ToString(), data, args.Timestamp));
+            new BleNotificationEventArgs(uuid, data, args.Timestamp));
     }
 
     private void OnConnectionStatusChanged(BluetoothLEDevice sender, object args)
     {
+        Trace?.Invoke(this, $"BLE device connection status changed: {sender.ConnectionStatus}.");
         ConnectionStatusChanged?.Invoke(this, sender.ConnectionStatus);
     }
 
@@ -398,6 +449,91 @@ public sealed class BleClient : IAsyncDisposable
         var maxMs = parameters.MaxConnectionInterval * 1.25;
         var timeoutMs = parameters.LinkTimeout * 10;
         return $"min={parameters.MinConnectionInterval} ({minMs:F2}ms), max={parameters.MaxConnectionInterval} ({maxMs:F2}ms), latency={parameters.ConnectionLatency}, timeout={timeoutMs}ms";
+    }
+
+    private void RecordNotificationDiagnostics(string uuid, int dataLength)
+    {
+        string? message = null;
+        lock (_notificationDiagnosticsLock)
+        {
+            var now = Stopwatch.GetTimestamp();
+            if (uuid.Equals(InputReportUuid, StringComparison.OrdinalIgnoreCase) ||
+                uuid.Equals(Fd2ReportParser.LegacyNotifyUuid, StringComparison.OrdinalIgnoreCase))
+            {
+                _inputNotifications++;
+                _inputBytes += dataLength;
+                _minimumInputSize = Math.Min(_minimumInputSize, dataLength);
+                _maximumInputSize = Math.Max(_maximumInputSize, dataLength);
+                if (_lastInputNotificationTicks > 0)
+                {
+                    var interval = now - _lastInputNotificationTicks;
+                    _inputIntervalTicks += interval;
+                    _inputIntervalSamples++;
+                    _minimumInputIntervalTicks = Math.Min(_minimumInputIntervalTicks, interval);
+                    _maximumInputIntervalTicks = Math.Max(_maximumInputIntervalTicks, interval);
+                }
+
+                _lastInputNotificationTicks = now;
+            }
+            else if (uuid.Equals(AckReportUuid, StringComparison.OrdinalIgnoreCase))
+            {
+                _ackNotifications++;
+            }
+            else
+            {
+                _otherNotifications++;
+            }
+
+            var windowTicks = now - _notificationWindowStartedTicks;
+            if (windowTicks >= Stopwatch.Frequency * 5L)
+            {
+                var seconds = windowTicks / (double)Stopwatch.Frequency;
+                var rate = _inputNotifications / seconds;
+                var averageSize = _inputNotifications > 0 ? _inputBytes / (double)_inputNotifications : 0;
+                var averageInterval = _inputIntervalSamples > 0
+                    ? _inputIntervalTicks * 1000.0 / Stopwatch.Frequency / _inputIntervalSamples
+                    : 0;
+                var minimumInterval = _minimumInputIntervalTicks != long.MaxValue
+                    ? _minimumInputIntervalTicks * 1000.0 / Stopwatch.Frequency
+                    : 0;
+                var maximumInterval = _maximumInputIntervalTicks * 1000.0 / Stopwatch.Frequency;
+                var minimumSize = _minimumInputSize != int.MaxValue ? _minimumInputSize : 0;
+                message =
+                    $"BLE notification window {seconds:F1}s: input={_inputNotifications} ({rate:F1} Hz), " +
+                    $"ack={_ackNotifications}, other={_otherNotifications}, " +
+                    $"inputBytes={_inputBytes}, size[min/avg/max]={minimumSize}/{averageSize:F1}/{_maximumInputSize}, " +
+                    $"intervalMs[min/avg/max]={minimumInterval:F2}/{averageInterval:F2}/{maximumInterval:F2}.";
+
+                _notificationWindowStartedTicks = now;
+                _inputNotifications = 0;
+                _ackNotifications = 0;
+                _otherNotifications = 0;
+                _inputBytes = 0;
+                _inputIntervalTicks = 0;
+                _inputIntervalSamples = 0;
+                _minimumInputIntervalTicks = long.MaxValue;
+                _maximumInputIntervalTicks = 0;
+                _minimumInputSize = int.MaxValue;
+                _maximumInputSize = 0;
+            }
+        }
+
+        if (message is not null)
+        {
+            Trace?.Invoke(this, message);
+        }
+    }
+
+    private static string DescribeCharacteristic(GattCharacteristic? characteristic) =>
+        characteristic is null
+            ? "none"
+            : $"{characteristic.Uuid} [{characteristic.CharacteristicProperties}]";
+
+    private static string FormatHexPrefix(ReadOnlySpan<byte> data)
+    {
+        const int maximumBytes = 24;
+        var prefix = Convert.ToHexString(data[..Math.Min(data.Length, maximumBytes)]);
+        return data.Length > maximumBytes ? prefix + "..." : prefix;
     }
 }
 

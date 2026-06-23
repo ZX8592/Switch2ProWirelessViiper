@@ -287,36 +287,24 @@ private void GoPrevStep()
 	private async Task CheckEnvironmentAsync()
 	{
 		EnvironmentStatusText.Text = T("checkingUsbip");
-		bool hasUsbip = false;
+		UsbipEnvironmentStatus environment;
 		try
 		{
-			using Process? process = Process.Start(new ProcessStartInfo
-			{
-				FileName = "pnputil",
-				Arguments = "/enum-drivers",
-				UseShellExecute = false,
-				CreateNoWindow = true,
-				RedirectStandardOutput = true
-			});
-			if (process != null && process.StandardOutput.ReadToEnd().Contains("usbip", StringComparison.OrdinalIgnoreCase))
-			{
-				hasUsbip = true;
-			}
+			environment = await UsbipVirtualController.InspectAsync(CancellationToken.None);
 		}
-		catch
+		catch (Exception ex)
 		{
-			hasUsbip = false;
+			environment = new UsbipEnvironmentStatus(null, false, ex.Message);
 		}
-		await Task.Delay(500);
-		if (hasUsbip)
+		if (environment.IsReady)
 		{
-			EnvironmentStatusText.Text = T("usbipReady");
+			EnvironmentStatusText.Text = $"{T("usbipReady")}{Environment.NewLine}{environment.Details}";
 			EnvironmentStatusText.Foreground = ThemeBrush("SystemFillColorSuccessBrush", Windows.UI.Color.FromArgb(byte.MaxValue, 16, 124, 16));
 			OnboardingUsbipButton.Visibility = Visibility.Collapsed;
 		}
 		else
 		{
-			EnvironmentStatusText.Text = T("usbipMissing");
+			EnvironmentStatusText.Text = $"{T("usbipMissing")}{Environment.NewLine}{environment.Details}";
 			EnvironmentStatusText.Foreground = ThemeBrush("SystemFillColorCriticalBrush", Windows.UI.Color.FromArgb(byte.MaxValue, 196, 43, 28));
 			OnboardingUsbipButton.Visibility = Visibility.Visible;
 		}
@@ -330,6 +318,7 @@ private async void OnboardingScanButton_Click_New(object sender, RoutedEventArgs
 		OnboardingScanResult.Text = string.Empty;
 		try
 		{
+			await Task.Yield();
 			CandidateItem[] array = (await _scanner.ScanAsync(TimeSpan.FromSeconds(12L), CancellationToken.None)).Select((BleDeviceCandidate c) => new CandidateItem(c)).ToArray();
 			if (array.Length != 0)
 			{
