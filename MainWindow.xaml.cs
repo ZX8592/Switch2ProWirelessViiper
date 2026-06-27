@@ -2200,7 +2200,7 @@ _settings.Save();
         }
         catch (Exception ex)
         {
-            Log("Scan failed: " + ex.Message);
+            Log("Scan failed: " + ex);
             SetStatus(T("statusScanFailed"), StatusBrush("error"));
         }
         finally

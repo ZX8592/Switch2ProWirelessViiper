@@ -150,16 +150,19 @@ public sealed class BleScanner
                 TraceMessage($"Bluetooth radio: name='{radio.Name}', kind={radio.Kind}, state={radio.State}.");
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (InvalidOperationException)
         {
             throw;
         }
         catch (UnauthorizedAccessException ex)
         {
-            throw new InvalidOperationException(
-                "Windows denied access to the Bluetooth radio. Check Bluetooth and location/privacy permissions for desktop apps. " +
-                DescribeException(ex),
-                ex);
+            TraceMessage(
+                "Bluetooth radio state access was denied; continuing scan because adapter BLE capability is available: " +
+                DescribeException(ex));
         }
         catch (Exception ex)
         {

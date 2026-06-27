@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32;
 
 namespace Switch2ProWirelessViiper.Core;
 
@@ -9,7 +10,7 @@ public sealed record UsbipEnvironmentStatus(
     bool DriverPackagePresent,
     string Details)
 {
-    public bool IsReady => UsbipExePath is not null && DriverPackagePresent;
+    public bool IsReady => DriverPackagePresent;
 }
 
 public static class UsbipVirtualController
@@ -36,18 +37,22 @@ public static class UsbipVirtualController
                 .ConfigureAwait(false);
             var output = result.CombinedOutput;
             driverPresent = output.Contains("usbip", StringComparison.OrdinalIgnoreCase) ||
-                            output.Contains("vhci", StringComparison.OrdinalIgnoreCase);
+                            output.Contains("vhci", StringComparison.OrdinalIgnoreCase) ||
+                            IsUsbipDriverServiceRegistered();
             driverDetails = driverPresent
                 ? "usbip-win2 driver package detected"
                 : "usbip-win2 driver package was not detected";
         }
         catch (Exception ex)
         {
-            driverDetails = "driver check failed: " + DescribeException(ex);
+            driverPresent = IsUsbipDriverServiceRegistered();
+            driverDetails = driverPresent
+                ? "usbip-win2 driver service detected"
+                : "driver check failed: " + DescribeException(ex);
         }
 
         var executableDetails = usbipExe is null
-            ? "usbip.exe was not found in PATH or known install folders"
+            ? "usbip.exe was not found; VIIPER native auto-attach can still work, manual usbip fallback is unavailable"
             : $"usbip.exe: {usbipExe}";
         return new UsbipEnvironmentStatus(
             usbipExe,
@@ -77,8 +82,9 @@ public static class UsbipVirtualController
         if (environment.UsbipExePath is null)
         {
             throw new InvalidOperationException(
-                "VIIPER created the virtual controller, but Windows did not attach it because usbip.exe was not found. " +
-                "Install usbip-win2, ensure usbip.exe is in PATH, and restart Windows.");
+                "VIIPER created the virtual controller, but Windows did not enumerate it. " +
+                "VIIPER native auto-attach did not complete, and usbip.exe was not found for manual fallback. " +
+                "Reinstall usbip-win2, reboot Windows, or add usbip.exe to PATH.");
         }
 
         var exportedBusId = $"{busId}-{deviceId}";
@@ -184,6 +190,32 @@ public static class UsbipVirtualController
         }
 
         return FindVirtualControllerInstanceId();
+    }
+
+    private static bool IsUsbipDriverServiceRegistered()
+    {
+        try
+        {
+            using var services = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services");
+            if (services is null)
+            {
+                return false;
+            }
+
+            foreach (var name in services.GetSubKeyNames())
+            {
+                if (name.Contains("usbip", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("vhci", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
     }
 
     private static string? ResolveUsbipExe()

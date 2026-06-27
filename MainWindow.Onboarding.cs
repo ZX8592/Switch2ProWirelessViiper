@@ -337,6 +337,7 @@ private async void OnboardingScanButton_Click_New(object sender, RoutedEventArgs
 		}
 		catch (Exception ex)
 		{
+			Log("Onboarding scan failed: " + ex);
 			OnboardingScanResult.Text = string.Format(T("scanFailedFormat"), ex.Message);
 			OnboardingScanResult.Foreground = ThemeBrush("SystemFillColorCriticalBrush", Windows.UI.Color.FromArgb(byte.MaxValue, 196, 43, 28));
 		}
