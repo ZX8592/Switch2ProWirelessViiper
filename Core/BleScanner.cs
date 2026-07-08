@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.Advertisement;
 using Windows.Devices.Enumeration;
@@ -7,9 +8,18 @@ using Windows.Storage.Streams;
 
 namespace Switch2ProWirelessViiper.Core;
 
+public sealed class BluetoothRadioOffException : InvalidOperationException
+{
+    public BluetoothRadioOffException(string message)
+        : base(message)
+    {
+    }
+}
+
 public sealed class BleScanner
 {
     private const ushort NintendoCompanyId = 0x0553;
+    private static readonly TimeSpan CandidateSettleDelay = TimeSpan.FromMilliseconds(900);
 
     public event EventHandler<string>? Trace;
 
@@ -90,6 +100,29 @@ public sealed class BleScanner
     public Task LogEnvironmentAsync(CancellationToken cancellationToken) =>
         ValidateBluetoothEnvironmentAsync(cancellationToken);
 
+    public async Task<bool> IsBluetoothRadioOffAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var adapter = await BluetoothAdapter.GetDefaultAsync()
+                .AsTask(cancellationToken)
+                .ConfigureAwait(false);
+            if (adapter is null || !adapter.IsLowEnergySupported)
+            {
+                return false;
+            }
+
+            var radio = await adapter.GetRadioAsync()
+                .AsTask(cancellationToken)
+                .ConfigureAwait(false);
+            return radio?.State is RadioState.Off or RadioState.Disabled;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public static byte[] ReadBytes(IBuffer buffer)
     {
         var reader = DataReader.FromBuffer(buffer);
@@ -139,7 +172,7 @@ public sealed class BleScanner
                 .ConfigureAwait(false);
             if (radio is not null && radio.State is RadioState.Off or RadioState.Disabled)
             {
-                throw new InvalidOperationException(
+                throw new BluetoothRadioOffException(
                     radio.State == RadioState.Disabled
                         ? "The Bluetooth radio is disabled by Windows or hardware. Enable it before scanning."
                         : "Bluetooth is turned off. Turn it on before scanning.");
@@ -181,6 +214,7 @@ public sealed class BleScanner
             ScanningMode = mode,
         };
         var stopped = new TaskCompletionSource<BluetoothError>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var candidateFound = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         long receivedCount = 0;
         long matchedCount = 0;
 
@@ -201,6 +235,7 @@ public sealed class BleScanner
                     : args.Advertisement.LocalName,
                 args.RawSignalStrengthInDBm,
                 args.Timestamp);
+            candidateFound.TrySetResult();
         }
 
         void OnStopped(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementWatcherStoppedEventArgs args) =>
@@ -222,8 +257,28 @@ public sealed class BleScanner
             }
 
             using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var scanStarted = Stopwatch.GetTimestamp();
             var delay = Task.Delay(duration, delayCts.Token);
-            var completed = await Task.WhenAny(delay, stopped.Task).ConfigureAwait(false);
+            var completed = await Task.WhenAny(delay, stopped.Task, candidateFound.Task).ConfigureAwait(false);
+            if (completed == candidateFound.Task)
+            {
+                var elapsed = Stopwatch.GetElapsedTime(scanStarted);
+                var remaining = duration - elapsed;
+                if (remaining > TimeSpan.Zero)
+                {
+                    var settleDelay = remaining < CandidateSettleDelay ? remaining : CandidateSettleDelay;
+                    var settle = Task.Delay(settleDelay, delayCts.Token);
+                    completed = await Task.WhenAny(settle, stopped.Task).ConfigureAwait(false);
+                    if (completed != stopped.Task)
+                    {
+                        TraceMessage(
+                            $"{mode} BLE scan found a Nintendo candidate; " +
+                            $"finishing early after {elapsed.TotalSeconds + settleDelay.TotalSeconds:F1}s.");
+                        return;
+                    }
+                }
+            }
+
             if (completed == stopped.Task)
             {
                 delayCts.Cancel();
@@ -263,19 +318,9 @@ public sealed class BleScanner
 
     private async Task TraceAdapterPropertiesAsync(string deviceId, CancellationToken cancellationToken)
     {
-        string[] requestedProperties =
-        [
-            "System.Devices.FriendlyName",
-            "System.Devices.Manufacturer",
-            "System.Devices.ModelName",
-            "System.Devices.DriverVersion",
-            "System.Devices.DriverDate",
-            "System.Devices.DeviceInstanceId",
-        ];
-
         try
         {
-            var info = await DeviceInformation.CreateFromIdAsync(deviceId, requestedProperties)
+            var info = await DeviceInformation.CreateFromIdAsync(deviceId)
                 .AsTask(cancellationToken)
                 .ConfigureAwait(false);
             if (info is null)
@@ -284,9 +329,7 @@ public sealed class BleScanner
                 return;
             }
 
-            var properties = requestedProperties
-                .Select(key => $"{key[(key.LastIndexOf('.') + 1)..]}={FormatProperty(info.Properties, key)}");
-            TraceMessage($"Bluetooth adapter identity: name='{info.Name}', {string.Join(", ", properties)}.");
+            TraceMessage($"Bluetooth adapter identity: name='{info.Name}', id='{info.Id}'.");
         }
         catch (Exception ex)
         {

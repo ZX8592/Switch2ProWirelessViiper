@@ -8,6 +8,7 @@ namespace Switch2ProWirelessViiper.Core;
 
 public sealed class ViiperBridge : IAsyncDisposable
 {
+    private const string AutoAttachLocalClientEnvironmentVariable = "VIIPER_API_AUTO_ATTACH_LOCAL_CLIENT";
     private readonly ViiperApiClient _api;
     private readonly TcpClient _streamClient;
     private readonly NetworkStream _stream;
@@ -56,6 +57,11 @@ public sealed class ViiperBridge : IAsyncDisposable
             if (ping is null)
             {
                 throw new InvalidOperationException($"VIIPER API is not reachable at {endpoint}.");
+            }
+
+            if (serverProcess is null)
+            {
+                trace?.Invoke("Using existing VIIPER server; this app cannot change its auto-attach setting.");
             }
 
             return new ViiperServerWarmup(
@@ -126,12 +132,29 @@ public sealed class ViiperBridge : IAsyncDisposable
             throw new InvalidOperationException($"VIIPER API is not reachable at {endpoint}.");
         }
 
+        if (serverProcess is null)
+        {
+            trace?.Invoke("Using existing VIIPER server; this app cannot change its auto-attach setting.");
+        }
+
         var (busId, createdBus) = await FindOrCreateBusAsync(api, cancellationToken).ConfigureAwait(false);
         DeviceResponse? device = null;
         TcpClient? stream = null;
         try
         {
-            device = await api.AddNs2ProAsync(busId, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                device = await api.AddNs2ProAsync(busId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException ex) when (LooksLikeViiperAutoAttachFailure(ex))
+            {
+                throw new InvalidOperationException(
+                    "VIIPER failed while adding the ns2pro virtual device. " +
+                    "This is usually caused by VIIPER auto-attach using an old usbip-win2 native IOCTL path. " +
+                    "Close any external viiper.exe process and let this app start VIIPER, or start external VIIPER with " +
+                    $"{AutoAttachLocalClientEnvironmentVariable}=false. Details: {ex.Message}",
+                    ex);
+            }
             trace?.Invoke($"VIIPER created ns2pro device {device.BusId}-{device.DevId}.");
             stream = await api.OpenStreamAsync(device.BusId, device.DevId, cancellationToken).ConfigureAwait(false);
             trace?.Invoke($"VIIPER ns2pro stream opened for {device.BusId}-{device.DevId}.");
@@ -352,7 +375,11 @@ public sealed class ViiperBridge : IAsyncDisposable
             WorkingDirectory = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
         };
+        info.Environment[AutoAttachLocalClientEnvironmentVariable] = "false";
+        trace?.Invoke("Starting VIIPER with local auto-attach disabled; this app will attach USBIP manually.");
         var process = new Process
         {
             StartInfo = info,
@@ -381,6 +408,16 @@ public sealed class ViiperBridge : IAsyncDisposable
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
         return process;
+    }
+
+
+    private static bool LooksLikeViiperAutoAttachFailure(Exception exception)
+    {
+        var message = exception.ToString();
+        return message.Contains("auto-attach", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("DeviceIoControl", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("IOControl", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("usbip", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task TryCleanupDeviceAsync(ViiperApiClient api, uint busId, string devId)

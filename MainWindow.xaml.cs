@@ -1,10 +1,11 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO;
 using System.Globalization;
 using System.Net;
 using System.Runtime;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
@@ -48,7 +49,9 @@ public sealed partial class MainWindow : Window
     private bool _allowExit;
     private bool _isHiddenToTray;
     private bool _stickCalibrationRunning;
+    private bool _isBluetoothOff;
     private CancellationTokenSource? _backgroundTrimCts;
+    private CancellationTokenSource? _bluetoothStateMonitorCts;
     private IntPtr _hwnd;
 
     private Grid RootGrid = null!;
@@ -245,6 +248,7 @@ public sealed partial class MainWindow : Window
         RootGrid.Loaded += (_, _) =>
         {
             ResizeMainWindow();
+            _ = RefreshBluetoothStateAsync();
             if (!ShouldStartToTray && _settings.PreloadViiper && _settings.FirstRunCompleted)
             {
                 _ = LoadViiperAsync();
@@ -998,6 +1002,9 @@ public sealed partial class MainWindow : Window
         _backgroundTrimCts?.Cancel();
         _backgroundTrimCts?.Dispose();
         _backgroundTrimCts = null;
+        _bluetoothStateMonitorCts?.Cancel();
+        _bluetoothStateMonitorCts?.Dispose();
+        _bluetoothStateMonitorCts = null;
         DisableProcessPerformanceMode();
         RemoveTrayIcon();
         DetachWindowProc();
@@ -1149,6 +1156,7 @@ _settings.Save();
         }
 
         Activate();
+        _ = RefreshBluetoothStateAsync();
         UpdateLiveView();
         if (openMenu)
         {
@@ -1519,6 +1527,7 @@ _settings.Save();
         AppTitleText.Text = T("appTitle");
         AppSubtitleText.Text = T("appSubtitle");
         MainHintText.Text = T("mainHint");
+        UpdateBluetoothButtons();
         TrayHintText.Text = T("trayHint");
         SetNavItemText(HomeNavItem, T("home"));
         SetNavItemText(SetupNavItem, T("setup"));
@@ -1589,6 +1598,7 @@ _settings.Save();
             OnboardingEnvDesc.Text = T("envDesc");
             OnboardingScanTitle.Text = T("scanTitle");
             OnboardingScanDesc.Text = T("scanDesc");
+            UpdateBluetoothButtons();
             OnboardingSettingsTitle.Text = T("startupSettings");
             OnboardingStartupCheckBox.Content = T("startWithWindows");
             OnboardingStartToTrayCheckBox.Content = T("startToTray");
@@ -1600,7 +1610,7 @@ _settings.Save();
         }
         EnvironmentTitleText.Text = T("environment");
         OnboardingScanButton.Content = T("scan");
-        UpdateConnectionUi();
+        UpdateBluetoothButtons();
         UpdateTrayMenu();
         UpdateEnvironmentStatus();
         UpdateLiveView();
@@ -1615,6 +1625,99 @@ _settings.Save();
             var hints = new[] { T("mainHint"), T("hint1"), T("hint2"), T("hint3"), T("hint4") };
             MainHintText.Text = hints[random.Next(hints.Length)];
         }
+    }
+
+    private async Task RefreshBluetoothStateAsync()
+    {
+        var isOff = await _scanner.IsBluetoothRadioOffAsync(CancellationToken.None).ConfigureAwait(true);
+        SetBluetoothOffState(isOff);
+    }
+
+    private void SetBluetoothOffState(bool isOff)
+    {
+        if (_isBluetoothOff == isOff)
+        {
+            UpdateBluetoothButtons();
+            return;
+        }
+
+        _isBluetoothOff = isOff;
+        UpdateBluetoothButtons();
+        if (isOff && !IsBleConnected)
+        {
+            SetStatus(T("statusBluetoothOff"), StatusBrush("warning"));
+        }
+    }
+
+    private void UpdateBluetoothButtons()
+    {
+        UpdateConnectionUi();
+        if (OnboardingScanButton is not null)
+        {
+            OnboardingScanButton.Content = _isBluetoothOff ? T("openBluetooth") : T("scan");
+        }
+    }
+
+    private async Task OpenBluetoothSettingsAndMonitorAsync()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "ms-settings:bluetooth",
+                UseShellExecute = true,
+            });
+            Log("Opening Windows Bluetooth settings.");
+        }
+        catch (Exception ex)
+        {
+            Log("Open Bluetooth settings failed: " + ex.Message);
+        }
+
+        _bluetoothStateMonitorCts?.Cancel();
+        _bluetoothStateMonitorCts?.Dispose();
+        _bluetoothStateMonitorCts = new CancellationTokenSource();
+        _ = MonitorBluetoothStateAsync(_bluetoothStateMonitorCts.Token);
+        await Task.CompletedTask;
+    }
+
+    private async Task MonitorBluetoothStateAsync(CancellationToken token)
+    {
+        for (var i = 0; i < 60 && !token.IsCancellationRequested; i++)
+        {
+            await Task.Delay(1000, token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            if (token.IsCancellationRequested)
+            {
+                break;
+            }
+
+            var isOff = await _scanner.IsBluetoothRadioOffAsync(token).ConfigureAwait(false);
+            RunOnUi(() =>
+            {
+                SetBluetoothOffState(isOff);
+                if (!isOff)
+                {
+                    SetStatus(T("statusIdle"), StatusBrush("neutral"));
+                }
+            });
+            if (!isOff)
+            {
+                break;
+            }
+        }
+    }
+
+    private static bool IsBluetoothOffException(Exception ex)
+    {
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is BluetoothRadioOffException)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private string T(string key)
@@ -1641,6 +1744,7 @@ _settings.Save();
                 "motion" => "体感",
                 "test" => "测试震动",
                 "scan" => "扫描",
+                "openBluetooth" => "打开蓝牙",
                 "calibrateSticks" => "校准摇杆",
                 "stickCalibrationNotSaved" => "未校准。默认使用 1.6x 摇杆输出归一化。",
                 "stickCalibrationConnectFirst" => "请先连接手柄，再开始校准摇杆。",
@@ -1665,7 +1769,7 @@ _settings.Save();
                 "backlog" => "待提交 / 错误",
                 "writes" => "写入次数",
                 "errors" => "错误次数",
-                "envDesc" => "请确认 usbip-win2 驱动已安装；未安装时 VIIPER 无法创建虚拟手柄。",
+                "envDesc" => "请确认 usbip-win2 驱动和 usbip.exe 可用；本程序会使用 usbip.exe 挂载虚拟手柄。",
                 "scanTitle" => "配对手柄",
                 "scanDesc" => "按住手柄顶部配对键，直到指示灯快速闪烁，然后点击“扫描”。",
                 "stepLanguage" => "语言",
@@ -1726,6 +1830,7 @@ _settings.Save();
                 "statusNeedsSetup" => "需要配置",
                 "statusConnectFailed" => "连接失败",
                 "statusScanFailed" => "扫描失败",
+                "statusBluetoothOff" => "蓝牙已关闭",
                 "statusDisconnected" => "已断开",
                 "statusBleDisconnected" => "蓝牙已断开",
                 "trayHint" => "关闭窗口后将根据设置决定是否驻留托盘。",
@@ -1744,14 +1849,14 @@ _settings.Save();
                 "latencyFormat" => "最近 {0:F2} ms / 平均 {1:F2} ms / 最高 {2:F2} ms",
                 "envStatusFormat" => "Windows: {0}{1}VIIPER: {2}{1}配置文件: {3}",
                 "checkingUsbip" => "正在检查 usbip-win2...",
-                "usbipReady" => "usbip-win2 已安装，可以继续。",
-                "usbipMissing" => "未检测到 usbip-win2。请下载安装后再继续，否则 VIIPER 可能无法创建虚拟手柄。",
+                "usbipReady" => "usbip-win2 驱动和 usbip.exe 已可用，可以继续。",
+                "usbipMissing" => "未检测到 usbip-win2 驱动或 usbip.exe。请安装 usbip-win2 并重启 Windows，否则无法挂载虚拟手柄。",
                 "scanSuccessFormat" => "已找到 {0} ({1})。",
                 "scanNotFound" => "未找到手柄。请确认手柄处于配对模式，指示灯正在闪烁。",
                 "scanFailedFormat" => "扫描失败：{0}",
                 "appTitle" => "Switch 2 Pro",
                 "appSubtitle" => "无线 VIIPER 桥接",
-                "mainHint" => "主界面只保留连接控制；更多状态、设置和日志在左侧菜单中。",
+                "mainHint" => "更多状态、设置和日志在左侧菜单中。",
                 "hint1" => "连接前请先在设置流程中扫描或填写手柄蓝牙地址。",
                 "hint2" => "可以在设置中调整自动断开时间。",
                 "hint3" => "状态页可以查看按键、摇杆和体感数据。",
@@ -1781,6 +1886,7 @@ _settings.Save();
                 "motion" => "モーション",
                 "test" => "振動テスト",
                 "scan" => "スキャン",
+                "openBluetooth" => "Bluetooth を開く",
                 "calibrateSticks" => "スティックを調整",
                 "stickCalibrationNotSaved" => "未調整です。既定の 1.6x スティック正規化を使用します。",
                 "stickCalibrationConnectFirst" => "スティックを調整する前にコントローラーを接続してください。",
@@ -1805,7 +1911,7 @@ _settings.Save();
                 "backlog" => "待機 / エラー",
                 "writes" => "書き込み回数",
                 "errors" => "エラー回数",
-                "envDesc" => "usbip-win2 ドライバーがインストールされていることを確認してください。未インストールの場合、VIIPER は仮想コントローラーを作成できません。",
+                "envDesc" => "usbip-win2 ドライバーと usbip.exe が利用可能であることを確認してください。このアプリは usbip.exe で仮想コントローラーを接続します。",
                 "scanTitle" => "コントローラーをペアリング",
                 "scanDesc" => "ランプが速く点滅するまでコントローラー上部のペアリングボタンを押し続けてから、「スキャン」をクリックしてください。",
                 "stepLanguage" => "言語",
@@ -1866,6 +1972,7 @@ _settings.Save();
                 "statusNeedsSetup" => "設定が必要",
                 "statusConnectFailed" => "接続失敗",
                 "statusScanFailed" => "スキャン失敗",
+                "statusBluetoothOff" => "Bluetooth がオフです",
                 "statusDisconnected" => "切断済み",
                 "statusBleDisconnected" => "Bluetooth が切断されました",
                 "trayHint" => "ウィンドウを閉じたときの動作は設定に従います。",
@@ -1884,14 +1991,14 @@ _settings.Save();
                 "latencyFormat" => "直近 {0:F2} ms / 平均 {1:F2} ms / 最大 {2:F2} ms",
                 "envStatusFormat" => "Windows: {0}{1}VIIPER: {2}{1}設定ファイル: {3}",
                 "checkingUsbip" => "usbip-win2 を確認しています...",
-                "usbipReady" => "usbip-win2 はインストール済みです。続行できます。",
-                "usbipMissing" => "usbip-win2 が見つかりません。インストールしないと VIIPER が仮想コントローラーを作成できない可能性があります。",
+                "usbipReady" => "usbip-win2 ドライバーと usbip.exe を検出しました。続行できます。",
+                "usbipMissing" => "usbip-win2 ドライバーまたは usbip.exe が見つかりません。usbip-win2 をインストールして Windows を再起動してください。",
                 "scanSuccessFormat" => "{0} ({1}) が見つかりました。",
                 "scanNotFound" => "コントローラーが見つかりません。ペアリングモードでランプが点滅していることを確認してください。",
                 "scanFailedFormat" => "スキャン失敗: {0}",
                 "appTitle" => "Switch 2 Pro",
                 "appSubtitle" => "ワイヤレス VIIPER ブリッジ",
-                "mainHint" => "ホーム画面には接続操作だけを表示します。状態、設定、ログはサイドメニューにあります。",
+                "mainHint" => "状態、設定、ログはサイドメニューにあります。",
                 "hint1" => "接続する前に、コントローラーの Bluetooth アドレスをスキャンまたは入力してください。",
                 "hint2" => "接続設定で自動切断時間を変更できます。",
                 "hint3" => "状態ページでボタン、スティック、モーションデータを確認できます。",
@@ -1919,6 +2026,7 @@ _settings.Save();
             "motion" => "Motion",
             "test" => "Test rumble",
             "scan" => "Scan",
+            "openBluetooth" => "Open Bluetooth",
             "calibrateSticks" => "Calibrate sticks",
             "stickCalibrationNotSaved" => "Not calibrated. Default 1.6x stick normalization is used.",
             "stickCalibrationConnectFirst" => "Connect the controller before calibrating sticks.",
@@ -1943,7 +2051,7 @@ _settings.Save();
             "backlog" => "Backlog/Drop",
             "writes" => "Writes",
             "errors" => "Errors",
-            "envDesc" => "Ensure usbip-win2 is installed.",
+            "envDesc" => "Ensure the usbip-win2 driver and usbip.exe are available. This app uses usbip.exe to attach the virtual controller.",
             "scanTitle" => "Ready to scan",
             "scanDesc" => "Hold the sync button until LEDs flash, then click scan.",
             "stepLanguage" => "Language",
@@ -2004,6 +2112,7 @@ _settings.Save();
             "statusNeedsSetup" => "Needs setup",
             "statusConnectFailed" => "Connect failed",
             "statusScanFailed" => "Scan failed",
+            "statusBluetoothOff" => "Bluetooth is off",
             "statusDisconnected" => "Disconnected",
             "statusBleDisconnected" => "BLE disconnected",
             "trayHint" => "Closing the window follows the tray behavior in Settings.",
@@ -2022,14 +2131,14 @@ _settings.Save();
             "latencyFormat" => "last {0:F2} ms / avg {1:F2} ms / max {2:F2} ms",
             "envStatusFormat" => "Windows: {0}{1}VIIPER: {2}{1}Config: {3}",
             "checkingUsbip" => "Checking for usbip-win2...",
-            "usbipReady" => "usbip-win2 is installed and ready.",
-            "usbipMissing" => "usbip-win2 was not found. Install it before continuing or VIIPER may not be able to create the virtual controller.",
+            "usbipReady" => "usbip-win2 driver and usbip.exe are available.",
+            "usbipMissing" => "usbip-win2 driver or usbip.exe was not found. Install usbip-win2 and reboot Windows before continuing.",
             "scanSuccessFormat" => "Found {0} ({1}).",
             "scanNotFound" => "No controllers found. Make sure the controller is in pairing mode with LEDs flashing.",
             "scanFailedFormat" => "Scan failed: {0}",
             "appTitle" => "Switch 2 Pro",
             "appSubtitle" => "Wireless VIIPER bridge",
-            "mainHint" => "The home screen keeps connection controls simple. Status, settings, and logs are in the side menu.",
+            "mainHint" => "Status, settings, and logs are in the side menu.",
             "hint1" => "Scan or enter the controller BLE address before connecting.",
             "hint2" => "Adjust auto disconnect in settings.",
             "hint3" => "Use the status page to inspect buttons, sticks, and motion data.",
@@ -2080,22 +2189,28 @@ _settings.Save();
         }
 
         ConnectButton.IsEnabled = !busy;
-        if (busy)
+        if (!busy && _isBluetoothOff && !IsBleConnected)
+        {
+            ConnectButtonText.Text = T("openBluetooth");
+            ConnectGlyph.Glyph = "";
+        }
+        else if (busy)
         {
             ConnectButtonText.Text = _viiper is null ? T("loadingViiper") : (IsBleConnected ? T("disconnecting") : T("connecting"));
+            ConnectGlyph.Glyph = IsBleConnected ? "" : "";
         }
         else
         {
             ConnectButtonText.Text = _viiper is null ? T("loadViiper") : (IsBleConnected ? T("disconnect") : T("connect"));
+            ConnectGlyph.Glyph = IsBleConnected ? "" : "";
         }
-        ConnectGlyph.Glyph = IsBleConnected ? "\uE711" : "\uE768";
         TestRumbleButton.IsEnabled = IsBleConnected;
         UpdateTrayMenu();
     }
 
     private void UpdateTrayMenu()
     {
-        _trayConnectText = _viiper is null ? T("loadViiper") : T(IsBleConnected ? "disconnect" : "connect");
+        _trayConnectText = _isBluetoothOff && !IsBleConnected ? T("openBluetooth") : (_viiper is null ? T("loadViiper") : T(IsBleConnected ? "disconnect" : "connect"));
         _trayExitText = T("exit");
     }
 
@@ -2195,13 +2310,16 @@ _settings.Save();
             }
 
             Log($"Scan complete: {items.Length} candidate(s).");
+            SetBluetoothOffState(false);
             SetStatus(T("statusIdle"), StatusBrush("neutral"));
             SaveSettingsFromUi();
         }
         catch (Exception ex)
         {
             Log("Scan failed: " + ex);
-            SetStatus(T("statusScanFailed"), StatusBrush("error"));
+            var bluetoothOff = IsBluetoothOffException(ex);
+            SetBluetoothOffState(bluetoothOff);
+            SetStatus(bluetoothOff ? T("statusBluetoothOff") : T("statusScanFailed"), StatusBrush(bluetoothOff ? "warning" : "error"));
         }
         finally
         {
@@ -2213,6 +2331,13 @@ _settings.Save();
     {
         try
         {
+            await RefreshBluetoothStateAsync().ConfigureAwait(true);
+            if (_isBluetoothOff && !IsBleConnected)
+            {
+                await OpenBluetoothSettingsAndMonitorAsync().ConfigureAwait(true);
+                return;
+            }
+
             await ToggleConnectionAsync().ConfigureAwait(true);
         }
         catch (Exception ex)
@@ -2301,6 +2426,7 @@ _settings.Save();
             _ble.ConnectionStatusChanged += OnBleStatusChanged;
             await _ble.ConnectAsync(address, _sessionCts.Token);
             ResetActivityBaseline();
+            SetBluetoothOffState(false);
             BleStatusText.Text = T("connectedValue");
             Log($"BLE connected: {address:X12}");
             SetStatus(T("statusConnected"), StatusBrush("success"));
@@ -2317,8 +2443,10 @@ _settings.Save();
                 (ex.InnerException is null
                     ? string.Empty
                     : $"; inner={ex.InnerException.GetType().FullName}: {ex.InnerException.Message}"));
+            var bluetoothOff = IsBluetoothOffException(ex);
+            SetBluetoothOffState(bluetoothOff);
             await DisconnectAsync().ConfigureAwait(true);
-            SetStatus(T("statusConnectFailed"), StatusBrush("error"));
+            SetStatus(bluetoothOff ? T("statusBluetoothOff") : T("statusConnectFailed"), StatusBrush(bluetoothOff ? "warning" : "error"));
             UpdateConnectionUi();
         }
     }
@@ -3243,6 +3371,7 @@ _settings.Save();
 
     private void Log(string message)
     {
+        message = StripAnsiControlSequences(message);
         var line = $"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}";
         _logBuffer.Append(line);
         if (_logBuffer.Length > MaxLogCharacters)
@@ -3265,6 +3394,15 @@ _settings.Save();
         {
         }
     }
+
+
+    private static string StripAnsiControlSequences(string value) =>
+        string.IsNullOrEmpty(value)
+            ? value
+            : AnsiControlSequenceRegex().Replace(value, string.Empty);
+
+    [GeneratedRegex(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled)]
+    private static partial Regex AnsiControlSequenceRegex();
 
     private static string DiagnosticLogPath =>
         Path.Combine(

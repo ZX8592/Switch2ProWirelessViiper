@@ -278,6 +278,10 @@ private void GoPrevStep()
         OnboardingStepLanguage.Visibility = ((_onboardingStep != OnboardingStep.Language) ? Visibility.Collapsed : Visibility.Visible);
         OnboardingStepEnvironment.Visibility = ((_onboardingStep != OnboardingStep.Environment) ? Visibility.Collapsed : Visibility.Visible);
         OnboardingStepScan.Visibility = ((_onboardingStep != OnboardingStep.Scan) ? Visibility.Collapsed : Visibility.Visible);
+        if (_onboardingStep == OnboardingStep.Scan)
+        {
+            _ = RefreshBluetoothStateAsync();
+        }
         OnboardingStepSettings.Visibility = ((_onboardingStep != OnboardingStep.Settings) ? Visibility.Collapsed : Visibility.Visible);
         OnboardingBackButton.Visibility = ((_onboardingStep == OnboardingStep.Language) ? Visibility.Collapsed : Visibility.Visible);
         OnboardingBackButton.Content = T("back");
@@ -294,7 +298,7 @@ private void GoPrevStep()
 		}
 		catch (Exception ex)
 		{
-			environment = new UsbipEnvironmentStatus(null, false, ex.Message);
+			environment = new UsbipEnvironmentStatus(null, false, ex.Message, false);
 		}
 		if (environment.IsReady)
 		{
@@ -318,6 +322,23 @@ private async void OnboardingScanButton_Click_New(object sender, RoutedEventArgs
 		OnboardingScanResult.Text = string.Empty;
 		try
 		{
+			await RefreshBluetoothStateAsync().ConfigureAwait(true);
+			if (_isBluetoothOff)
+			{
+				OnboardingScanProgress.IsActive = false;
+				await OpenBluetoothSettingsAndMonitorAsync().ConfigureAwait(true);
+				return;
+			}
+		}
+		finally
+		{
+			if (!_isBluetoothOff)
+			{
+				OnboardingScanProgress.IsActive = true;
+			}
+		}
+		try
+		{
 			await Task.Yield();
 			CandidateItem[] array = (await _scanner.ScanAsync(TimeSpan.FromSeconds(12L), CancellationToken.None)).Select((BleDeviceCandidate c) => new CandidateItem(c)).ToArray();
 			if (array.Length != 0)
@@ -326,11 +347,13 @@ private async void OnboardingScanButton_Click_New(object sender, RoutedEventArgs
 				_settings.BluetoothAddress = candidateItem.BluetoothAddress.ToString("X12");
 				_settings.Save();
 				AddressBox.Text = _settings.BluetoothAddress;
+				SetBluetoothOffState(false);
 				OnboardingScanResult.Text = string.Format(T("scanSuccessFormat"), candidateItem.DisplayText, candidateItem.BluetoothAddress.ToString("X12"));
 				OnboardingScanResult.Foreground = ThemeBrush("SystemFillColorSuccessBrush", Windows.UI.Color.FromArgb(byte.MaxValue, 16, 124, 16));
 			}
 			else
 			{
+				SetBluetoothOffState(false);
 				OnboardingScanResult.Text = T("scanNotFound");
 				OnboardingScanResult.Foreground = ThemeBrush("SystemFillColorCriticalBrush", Windows.UI.Color.FromArgb(byte.MaxValue, 196, 43, 28));
 			}
@@ -338,7 +361,11 @@ private async void OnboardingScanButton_Click_New(object sender, RoutedEventArgs
 		catch (Exception ex)
 		{
 			Log("Onboarding scan failed: " + ex);
-			OnboardingScanResult.Text = string.Format(T("scanFailedFormat"), ex.Message);
+			var bluetoothOff = IsBluetoothOffException(ex);
+			SetBluetoothOffState(bluetoothOff);
+			OnboardingScanResult.Text = bluetoothOff
+				? string.Empty
+				: string.Format(T("scanFailedFormat"), ex.Message);
 			OnboardingScanResult.Foreground = ThemeBrush("SystemFillColorCriticalBrush", Windows.UI.Color.FromArgb(byte.MaxValue, 196, 43, 28));
 		}
 		finally

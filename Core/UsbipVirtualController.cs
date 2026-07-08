@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace Switch2ProWirelessViiper.Core;
@@ -8,9 +9,10 @@ namespace Switch2ProWirelessViiper.Core;
 public sealed record UsbipEnvironmentStatus(
     string? UsbipExePath,
     bool DriverPackagePresent,
-    string Details)
+    string Details,
+    bool UsbipExeCompatible)
 {
-    public bool IsReady => DriverPackagePresent;
+    public bool IsReady => DriverPackagePresent && UsbipExePath is not null && UsbipExeCompatible;
 }
 
 public static class UsbipVirtualController
@@ -24,7 +26,10 @@ public static class UsbipVirtualController
 
     public static async Task<UsbipEnvironmentStatus> InspectAsync(CancellationToken cancellationToken)
     {
-        var usbipExe = ResolveUsbipExe();
+        var executable = await ResolveCompatibleUsbipExeAsync(cancellationToken).ConfigureAwait(false);
+        var usbipExe = executable.Path;
+        var executableDetails = executable.Details;
+
         var driverPresent = false;
         string driverDetails;
         try
@@ -36,12 +41,15 @@ public static class UsbipVirtualController
                     cancellationToken)
                 .ConfigureAwait(false);
             var output = result.CombinedOutput;
+            var driverPackageSummary = SummarizeUsbipDriverPackages(output);
             driverPresent = output.Contains("usbip", StringComparison.OrdinalIgnoreCase) ||
                             output.Contains("vhci", StringComparison.OrdinalIgnoreCase) ||
                             IsUsbipDriverServiceRegistered();
-            driverDetails = driverPresent
-                ? "usbip-win2 driver package detected"
-                : "usbip-win2 driver package was not detected";
+            driverDetails = !string.IsNullOrWhiteSpace(driverPackageSummary)
+                ? $"usbip-win2 driver package detected: {driverPackageSummary}"
+                : driverPresent
+                    ? "usbip-win2 driver service detected"
+                    : "usbip-win2 driver package was not detected";
         }
         catch (Exception ex)
         {
@@ -51,13 +59,11 @@ public static class UsbipVirtualController
                 : "driver check failed: " + DescribeException(ex);
         }
 
-        var executableDetails = usbipExe is null
-            ? "usbip.exe was not found; VIIPER native auto-attach can still work, manual usbip fallback is unavailable"
-            : $"usbip.exe: {usbipExe}";
         return new UsbipEnvironmentStatus(
             usbipExe,
             driverPresent,
-            $"{driverDetails}; {executableDetails}");
+            $"{driverDetails}; {executableDetails}",
+            executable.Compatible);
     }
 
     public static async Task<string> EnsureAttachedAsync(
@@ -67,10 +73,7 @@ public static class UsbipVirtualController
         Action<string>? trace,
         CancellationToken cancellationToken)
     {
-        var instanceId = await WaitForVirtualControllerAsync(
-                TimeSpan.FromSeconds(3),
-                cancellationToken)
-            .ConfigureAwait(false);
+        var instanceId = FindVirtualControllerInstanceId();
         if (instanceId is not null)
         {
             trace?.Invoke("Virtual Switch 2 Pro USB device is present: " + instanceId);
@@ -79,23 +82,36 @@ public static class UsbipVirtualController
 
         var environment = await InspectAsync(cancellationToken).ConfigureAwait(false);
         trace?.Invoke("USBIP environment: " + environment.Details);
-        if (environment.UsbipExePath is null)
+        if (environment.UsbipExePath is null || !environment.UsbipExeCompatible)
         {
             throw new InvalidOperationException(
                 "VIIPER created the virtual controller, but Windows did not enumerate it. " +
-                "VIIPER native auto-attach did not complete, and usbip.exe was not found for manual fallback. " +
-                "Reinstall usbip-win2, reboot Windows, or add usbip.exe to PATH.");
+                "This app disables VIIPER native auto-attach for usbip-win2 compatibility, " +
+                "but a compatible usbip.exe was not found for manual attach. " +
+                environment.Details + " " +
+                "Reinstall usbip-win2, make sure usbip.exe and the driver come from the same version, then reboot Windows.");
         }
 
         var exportedBusId = $"{busId}-{deviceId}";
         trace?.Invoke($"VIIPER auto-attach did not produce a Windows HID device; attaching USBIP bus {exportedBusId} manually.");
         var attach = await RunProcessAsync(
                 environment.UsbipExePath,
-                $"attach --remote {host} --tcp-port {ViiperUsbipPort} --busid {exportedBusId}",
+                $"--tcp-port {ViiperUsbipPort} attach --remote {host} --bus-id {exportedBusId}",
                 TimeSpan.FromSeconds(15),
                 cancellationToken)
             .ConfigureAwait(false);
         trace?.Invoke($"usbip attach exited with code {attach.ExitCode}: {attach.Summary}");
+        if (attach.ExitCode != 0)
+        {
+            trace?.Invoke("Retrying usbip attach with legacy argument order.");
+            attach = await RunProcessAsync(
+                    environment.UsbipExePath,
+                    $"--tcp-port {ViiperUsbipPort} attach -r {host} --bus-id {exportedBusId}",
+                    TimeSpan.FromSeconds(15),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            trace?.Invoke($"usbip attach retry exited with code {attach.ExitCode}: {attach.Summary}");
+        }
 
         instanceId = await WaitForVirtualControllerAsync(
                 TimeSpan.FromSeconds(10),
@@ -218,15 +234,100 @@ public static class UsbipVirtualController
         return false;
     }
 
-    private static string? ResolveUsbipExe()
+    private static async Task<UsbipExecutableProbe> ResolveCompatibleUsbipExeAsync(CancellationToken cancellationToken)
+    {
+        var candidates = BuildUsbipExeCandidates()
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path =>
+            {
+                try { return Path.GetFullPath(path!); }
+                catch { return string.Empty; }
+            })
+            .Where(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (candidates.Length == 0)
+        {
+            return new UsbipExecutableProbe(null, false, "usbip.exe was not found; manual USBIP attach is unavailable");
+        }
+
+        var rejected = new List<string>();
+        foreach (var candidate in candidates)
+        {
+            var probe = await ProbeUsbipExeAsync(candidate, cancellationToken).ConfigureAwait(false);
+            if (probe.Compatible)
+            {
+                return probe;
+            }
+
+            rejected.Add(probe.Details);
+        }
+
+        var details = string.Join("; ", rejected.Take(5));
+        if (rejected.Count > 5)
+        {
+            details += $"; {rejected.Count - 5} more candidate(s) skipped";
+        }
+
+        return new UsbipExecutableProbe(
+            null,
+            false,
+            "No compatible usbip.exe was found. " + details);
+    }
+
+    private static async Task<UsbipExecutableProbe> ProbeUsbipExeAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        var description = DescribeUsbipExe(path);
+        try
+        {
+            var result = await RunProcessAsync(
+                    path,
+                    "port",
+                    TimeSpan.FromSeconds(5),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var summary = result.Summary;
+            if (result.ExitCode == 0)
+            {
+                return new UsbipExecutableProbe(path, true, $"{description}, ABI check passed");
+            }
+
+            var reason = summary.Contains("ABI mismatch", StringComparison.OrdinalIgnoreCase)
+                ? "ABI mismatch with installed usbip-win2 driver"
+                : $"probe exited with code {result.ExitCode}: {summary}";
+            return new UsbipExecutableProbe(null, false, $"{description}, skipped: {reason}");
+        }
+        catch (Exception ex)
+        {
+            return new UsbipExecutableProbe(null, false, $"{description}, skipped: probe failed: {DescribeException(ex)}");
+        }
+    }
+
+    private static IEnumerable<string?> BuildUsbipExeCandidates()
     {
         var candidates = new List<string?>
         {
             Path.Combine(AppContext.BaseDirectory, "usbip.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "usbip-win2", "usbip.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "usbip-win2", "usbip.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "USBIP", "usbip.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "USBIP", "usbip.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "usbip.exe"),
         };
+
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            candidates.Add(Path.Combine(dir.FullName, "usbip.exe"));
+        }
+
+        foreach (var directory in GetUsbipInstallDirectoriesFromRegistry())
+        {
+            candidates.Add(Path.Combine(directory, "usbip.exe"));
+            candidates.Add(Path.Combine(directory, "bin", "usbip.exe"));
+        }
 
         var pathValue = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
         foreach (var directory in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
@@ -238,22 +339,94 @@ public static class UsbipVirtualController
             }
         }
 
-        foreach (var candidate in candidates.Where(path => !string.IsNullOrWhiteSpace(path)))
+        return candidates;
+    }
+
+    private static IEnumerable<string> GetUsbipInstallDirectoriesFromRegistry()
+    {
+        const string uninstallPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        foreach (var root in new[] { Registry.LocalMachine, Registry.CurrentUser })
         {
-            try
+            foreach (var viewPath in new[] { uninstallPath, @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" })
             {
-                var fullPath = Path.GetFullPath(candidate!);
-                if (File.Exists(fullPath))
+                using var uninstall = root.OpenSubKey(viewPath);
+                if (uninstall is null)
                 {
-                    return fullPath;
+                    continue;
+                }
+
+                foreach (var subKeyName in uninstall.GetSubKeyNames())
+                {
+                    using var subKey = uninstall.OpenSubKey(subKeyName);
+                    var displayName = subKey?.GetValue("DisplayName") as string;
+                    if (string.IsNullOrWhiteSpace(displayName) ||
+                        !displayName.Contains("usbip", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    foreach (var valueName in new[] { "InstallLocation", "InstallSource" })
+                    {
+                        var directory = subKey?.GetValue(valueName) as string;
+                        if (!string.IsNullOrWhiteSpace(directory))
+                        {
+                            yield return directory.Trim().Trim('"');
+                        }
+                    }
                 }
             }
-            catch
-            {
-            }
+        }
+    }
+
+    private static string DescribeUsbipExe(string path)
+    {
+        try
+        {
+            var version = FileVersionInfo.GetVersionInfo(path);
+            var versionText = !string.IsNullOrWhiteSpace(version.ProductVersion)
+                ? version.ProductVersion
+                : version.FileVersion;
+            return string.IsNullOrWhiteSpace(versionText)
+                ? $"usbip.exe: {path}"
+                : $"usbip.exe: {path}, version {versionText}";
+        }
+        catch
+        {
+            return $"usbip.exe: {path}";
+        }
+    }
+
+    private static string SummarizeUsbipDriverPackages(string output)
+    {
+        var blocks = output
+            .Split(["\r\n\r\n", "\n\n"], StringSplitOptions.RemoveEmptyEntries)
+            .Where(block => block.Contains("usbip", StringComparison.OrdinalIgnoreCase) ||
+                            block.Contains("vhci", StringComparison.OrdinalIgnoreCase))
+            .Take(3)
+            .Select(SummarizeDriverPackageBlock)
+            .Where(block => !string.IsNullOrWhiteSpace(block))
+            .ToArray();
+
+        if (blocks.Length == 0)
+        {
+            return string.Empty;
         }
 
-        return null;
+        return string.Join(" | ", blocks);
+    }
+
+    private static string SummarizeDriverPackageBlock(string block)
+    {
+        var compact = block.Replace("\r", " ").Replace("\n", " ").Trim();
+        var published = Regex.Match(compact, @"oem\d+\.inf", RegexOptions.IgnoreCase).Value;
+        var original = Regex.Match(compact, @"usbip[^\s:;|]*\.inf", RegexOptions.IgnoreCase).Value;
+        var version = Regex.Match(compact, @"\d{2}/\d{2}/\d{4}\s+\d+(?:\.\d+)+", RegexOptions.IgnoreCase).Value;
+
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(published)) parts.Add($"published={published}");
+        if (!string.IsNullOrWhiteSpace(original)) parts.Add($"original={original}");
+        if (!string.IsNullOrWhiteSpace(version)) parts.Add($"driverVersion={version}");
+        return parts.Count == 0 ? "usbip/vhci driver package detected" : string.Join(", ", parts);
     }
 
     private static async Task<ProcessResult> RunProcessAsync(
@@ -272,6 +445,8 @@ public static class UsbipVirtualController
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
             },
         };
         if (!process.Start())
@@ -300,6 +475,8 @@ public static class UsbipVirtualController
 
     private static string DescribeException(Exception exception) =>
         $"{exception.Message} (HRESULT 0x{exception.HResult:X8})";
+
+    private sealed record UsbipExecutableProbe(string? Path, bool Compatible, string Details);
 
     private sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError)
     {
