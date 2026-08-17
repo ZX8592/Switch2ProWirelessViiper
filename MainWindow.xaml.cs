@@ -37,6 +37,7 @@ public sealed partial class MainWindow : Window
     private readonly Switch2State _viewState = new();
     private readonly object _stateLock = new();
     private readonly object _rumbleLock = new();
+    private readonly object _viiperLoadLock = new();
     private readonly SemaphoreSlim _submitSignal = new(0, int.MaxValue);
     private readonly StringBuilder _logBuffer = new();
     private readonly DispatcherTimer _uiTimer;
@@ -50,6 +51,8 @@ public sealed partial class MainWindow : Window
     private bool _isHiddenToTray;
     private bool _stickCalibrationRunning;
     private bool _isBluetoothOff;
+    private bool _isViiperLoading;
+    private Task? _viiperLoadTask;
     private CancellationTokenSource? _backgroundTrimCts;
     private CancellationTokenSource? _bluetoothStateMonitorCts;
     private IntPtr _hwnd;
@@ -2188,13 +2191,14 @@ _settings.Save();
             TrayHintText.Text = _settings.MinimizeToTray ? T("trayHintEnabled") : T("trayHintDisabled");
         }
 
-        ConnectButton.IsEnabled = !busy;
-        if (!busy && _isBluetoothOff && !IsBleConnected)
+        var viiperLoading = _isViiperLoading || (busy && _viiper is null);
+        ConnectButton.IsEnabled = !busy && !_isViiperLoading;
+        if (!viiperLoading && !busy && _isBluetoothOff && !IsBleConnected)
         {
             ConnectButtonText.Text = T("openBluetooth");
             ConnectGlyph.Glyph = "";
         }
-        else if (busy)
+        else if (busy || viiperLoading)
         {
             ConnectButtonText.Text = _viiper is null ? T("loadingViiper") : (IsBleConnected ? T("disconnecting") : T("connecting"));
             ConnectGlyph.Glyph = IsBleConnected ? "" : "";
@@ -2210,7 +2214,19 @@ _settings.Save();
 
     private void UpdateTrayMenu()
     {
-        _trayConnectText = _isBluetoothOff && !IsBleConnected ? T("openBluetooth") : (_viiper is null ? T("loadViiper") : T(IsBleConnected ? "disconnect" : "connect"));
+        if (_isBluetoothOff && !IsBleConnected)
+        {
+            _trayConnectText = T("openBluetooth");
+        }
+        else if (_isViiperLoading)
+        {
+            _trayConnectText = T("loadingViiper");
+        }
+        else
+        {
+            _trayConnectText = _viiper is null ? T("loadViiper") : T(IsBleConnected ? "disconnect" : "connect");
+        }
+
         _trayExitText = T("exit");
     }
 
@@ -2348,25 +2364,48 @@ _settings.Save();
         }
     }
 
-        private async Task LoadViiperAsync()
+    private Task LoadViiperAsync()
     {
-        SaveSettingsFromUi();
-        StartViiperWarmup();
-        UpdateConnectionUi(busy: true);
+        lock (_viiperLoadLock)
+        {
+            if (_viiper?.VirtualDeviceReady == true)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (_viiperLoadTask is { IsCompleted: false })
+            {
+                return _viiperLoadTask;
+            }
+
+            _viiperLoadTask = LoadViiperCoreAsync();
+            return _viiperLoadTask;
+        }
+    }
+
+    private async Task LoadViiperCoreAsync()
+    {
+        _isViiperLoading = true;
         try
         {
+            SaveSettingsFromUi();
+            StartViiperWarmup();
+            UpdateConnectionUi();
             SetStatus(T("statusLoadingViiper"), StatusBrush("warning"));
             Log("Loading VIIPER output...");
             await EnsureViiperWarmupAsync(CancellationToken.None).ConfigureAwait(true);
-            _viiper = await ViiperBridge.ConnectAsync(
+            var viiper = await ViiperBridge.ConnectAsync(
                 ViiperAddressBox.Text.Trim(),
                 string.IsNullOrWhiteSpace(ViiperExeBox.Text) ? null : ViiperExeBox.Text.Trim(),
                 CancellationToken.None,
                 message => RunOnUi(() => Log(message)));
-            if (!_viiper.VirtualDeviceReady)
+            if (!viiper.VirtualDeviceReady)
             {
+                await viiper.DisposeAsync().ConfigureAwait(true);
                 throw new InvalidOperationException("VIIPER did not confirm the virtual USB controller.");
             }
+
+            _viiper = viiper;
             _viiper.HidOutputReceived += OnViiperHidOutput;
             ViiperStatusText.Text = _viiper.Description;
             Log("VIIPER ready: " + _viiper.Description);
@@ -2380,6 +2419,12 @@ _settings.Save();
         }
         finally
         {
+            _isViiperLoading = false;
+            lock (_viiperLoadLock)
+            {
+                _viiperLoadTask = null;
+            }
+
             UpdateConnectionUi();
         }
     }
