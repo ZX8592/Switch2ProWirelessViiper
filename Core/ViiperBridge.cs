@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -9,13 +11,16 @@ namespace Switch2ProWirelessViiper.Core;
 public sealed class ViiperBridge : IAsyncDisposable
 {
     private const string AutoAttachLocalClientEnvironmentVariable = "VIIPER_API_AUTO_ATTACH_LOCAL_CLIENT";
+    private static readonly SemaphoreSlim ServerLock = new(1, 1);
+    private static readonly ConcurrentDictionary<int, Process> OwnedServerProcesses = new();
+    private static ServerSession? _managedServer;
     private readonly ViiperApiClient _api;
     private readonly TcpClient _streamClient;
     private readonly NetworkStream _stream;
     private readonly CancellationTokenSource _readCts = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly byte[] _inputBuffer = new byte[ViiperNs2ProWire.InputSize];
-    private readonly Process? _ownedServer;
+    private readonly ServerLease _serverLease;
     private readonly bool _createdBus;
     private readonly uint _busId;
     private readonly string _devId;
@@ -28,61 +33,31 @@ public sealed class ViiperBridge : IAsyncDisposable
     public bool VirtualDeviceReady { get; }
     public string VirtualDeviceInstanceId { get; }
 
+    static ViiperBridge()
+    {
+        // WinUI window-close handlers cannot keep the application alive while awaiting cleanup.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            foreach (var process in OwnedServerProcesses.Values) TryStopOwnedServer(process);
+        };
+    }
+
     public static async Task<ViiperServerWarmup> WarmupServerAsync(
         string apiAddress,
         string? viiperExePath,
         CancellationToken cancellationToken,
         Action<string>? trace = null)
     {
-        var endpoint = ViiperEndpoint.Parse(string.IsNullOrWhiteSpace(apiAddress) ? "localhost:3242" : apiAddress);
-        var api = new ViiperApiClient(endpoint);
-        Process? serverProcess = null;
-
-        try
-        {
-            var ping = await TryPingAsync(api, cancellationToken).ConfigureAwait(false);
-            if (ping is null)
-            {
-                var exe = ResolveViiperExe(viiperExePath);
-                if (exe is null)
-                {
-                    throw new FileNotFoundException(
-                        "VIIPER is not running and viiper.exe was not found. Put viiper.exe beside this app or browse to it.");
-                }
-
-                serverProcess = StartViiperServer(exe, endpoint, trace);
-                ping = await WaitForPingAsync(api, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
-            }
-
-            if (ping is null)
-            {
-                throw new InvalidOperationException($"VIIPER API is not reachable at {endpoint}.");
-            }
-
-            if (serverProcess is null)
-            {
-                trace?.Invoke("Using existing VIIPER server; this app cannot change its auto-attach setting.");
-            }
-
-            return new ViiperServerWarmup(
-                serverProcess,
-                $"VIIPER server {endpoint} v{ping.Version ?? "unknown"} ready");
-        }
-        catch
-        {
-            if (serverProcess is not null && !serverProcess.HasExited)
-            {
-                TryStopOwnedServer(serverProcess);
-            }
-
-            throw;
-        }
+        var lease = await AcquireServerAsync(apiAddress, viiperExePath, cancellationToken, trace).ConfigureAwait(false);
+        return new ViiperServerWarmup(
+            lease.DisposeAsync,
+            $"VIIPER server {lease.Session.Endpoint} v{lease.Session.Version} ready");
     }
 
     private ViiperBridge(
         ViiperApiClient api,
         TcpClient streamClient,
-        Process? ownedServer,
+        ServerLease serverLease,
         bool createdBus,
         uint busId,
         string devId,
@@ -93,7 +68,7 @@ public sealed class ViiperBridge : IAsyncDisposable
         _api = api;
         _streamClient = streamClient;
         _stream = streamClient.GetStream();
-        _ownedServer = ownedServer;
+        _serverLease = serverLease;
         _createdBus = createdBus;
         _busId = busId;
         _devId = devId;
@@ -109,39 +84,17 @@ public sealed class ViiperBridge : IAsyncDisposable
         CancellationToken cancellationToken,
         Action<string>? trace = null)
     {
-        var endpoint = ViiperEndpoint.Parse(string.IsNullOrWhiteSpace(apiAddress) ? "localhost:3242" : apiAddress);
+        var lease = await AcquireServerAsync(apiAddress, viiperExePath, cancellationToken, trace).ConfigureAwait(false);
+        var session = lease.Session;
+        var endpoint = session.Endpoint;
         var api = new ViiperApiClient(endpoint);
-        Process? serverProcess = null;
-
-        var ping = await TryPingAsync(api, cancellationToken).ConfigureAwait(false);
-        if (ping is null)
-        {
-            var exe = ResolveViiperExe(viiperExePath);
-            if (exe is null)
-            {
-                throw new FileNotFoundException(
-                    "VIIPER is not running and viiper.exe was not found. Put viiper.exe beside this app or browse to it.");
-            }
-
-            serverProcess = StartViiperServer(exe, endpoint, trace);
-            ping = await WaitForPingAsync(api, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
-        }
-
-        if (ping is null)
-        {
-            throw new InvalidOperationException($"VIIPER API is not reachable at {endpoint}.");
-        }
-
-        if (serverProcess is null)
-        {
-            trace?.Invoke("Using existing VIIPER server; this app cannot change its auto-attach setting.");
-        }
-
-        var (busId, createdBus) = await FindOrCreateBusAsync(api, cancellationToken).ConfigureAwait(false);
+        uint busId = 0;
+        var createdBus = false;
         DeviceResponse? device = null;
         TcpClient? stream = null;
         try
         {
+            (busId, createdBus) = await FindOrCreateBusAsync(api, cancellationToken).ConfigureAwait(false);
             try
             {
                 device = await api.AddNs2ProAsync(busId, cancellationToken).ConfigureAwait(false);
@@ -149,10 +102,7 @@ public sealed class ViiperBridge : IAsyncDisposable
             catch (InvalidOperationException ex) when (LooksLikeViiperAutoAttachFailure(ex))
             {
                 throw new InvalidOperationException(
-                    "VIIPER failed while adding the ns2pro virtual device. " +
-                    "This is usually caused by VIIPER auto-attach using an old usbip-win2 native IOCTL path. " +
-                    "Close any external viiper.exe process and let this app start VIIPER, or start external VIIPER with " +
-                    $"{AutoAttachLocalClientEnvironmentVariable}=false. Details: {ex.Message}",
+                    DescribeAutoAttachFailure(ex),
                     ex);
             }
             trace?.Invoke($"VIIPER created ns2pro device {device.BusId}-{device.DevId}.");
@@ -163,16 +113,18 @@ public sealed class ViiperBridge : IAsyncDisposable
                     device.BusId,
                     device.DevId,
                     trace,
-                    cancellationToken)
+                    cancellationToken,
+                    session.UsbipPort,
+                    allowExistingDevice: session.Process is null)
                 .ConfigureAwait(false);
             return new ViiperBridge(
                 api,
                 stream,
-                serverProcess,
+                lease,
                 createdBus,
                 device.BusId,
                 device.DevId,
-                ping.Version ?? "unknown",
+                session.Version,
                 endpoint,
                 virtualDeviceInstanceId);
         }
@@ -189,10 +141,7 @@ public sealed class ViiperBridge : IAsyncDisposable
                 await TryCleanupBusAsync(api, busId).ConfigureAwait(false);
             }
 
-            if (serverProcess is not null && !serverProcess.HasExited)
-            {
-                TryStopOwnedServer(serverProcess);
-            }
+            await lease.DisposeAsync().ConfigureAwait(false);
 
             throw;
         }
@@ -249,10 +198,7 @@ public sealed class ViiperBridge : IAsyncDisposable
             await TryCleanupBusAsync(_api, _busId).ConfigureAwait(false);
         }
 
-        if (_ownedServer is not null && !_ownedServer.HasExited)
-        {
-            TryStopOwnedServer(_ownedServer);
-        }
+        await _serverLease.DisposeAsync().ConfigureAwait(false);
     }
 
     private async Task ReadLoopAsync(CancellationToken cancellationToken)
@@ -297,14 +243,21 @@ public sealed class ViiperBridge : IAsyncDisposable
         }
     }
 
-    private static async Task<PingResponse?> TryPingAsync(ViiperApiClient api, CancellationToken cancellationToken)
+    private static async Task<PingResponse?> TryPingAsync(ViiperApiClient api, CancellationToken cancellationToken, Action<string>? onFailure = null)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(3));
         try
         {
-            return await api.PingAsync(cancellationToken).ConfigureAwait(false);
+            return await api.PingAsync(timeout.Token).ConfigureAwait(false);
         }
-        catch
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            onFailure?.Invoke(ex.Message);
             return null;
         }
     }
@@ -312,12 +265,24 @@ public sealed class ViiperBridge : IAsyncDisposable
     private static async Task<PingResponse?> WaitForPingAsync(
         ViiperApiClient api,
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Process? process = null,
+        Action<string>? trace = null)
     {
         var deadline = DateTimeOffset.UtcNow.Add(timeout);
+        string? lastFailure = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
-            var ping = await TryPingAsync(api, cancellationToken).ConfigureAwait(false);
+            if (process is { HasExited: true })
+            {
+                throw new InvalidOperationException($"VIIPER exited during startup with code {process.ExitCode}. Check the server log and listening ports.");
+            }
+            var ping = await TryPingAsync(api, cancellationToken, failure =>
+            {
+                if (failure == lastFailure) return;
+                lastFailure = failure;
+                trace?.Invoke("VIIPER startup ping failed: " + failure);
+            }).ConfigureAwait(false);
             if (ping is not null)
             {
                 return ping;
@@ -343,6 +308,123 @@ public sealed class ViiperBridge : IAsyncDisposable
         return (created.BusId, true);
     }
 
+    private static async Task<ServerLease> AcquireServerAsync(
+        string apiAddress,
+        string? viiperExePath,
+        CancellationToken cancellationToken,
+        Action<string>? trace)
+    {
+        var requested = ViiperEndpoint.Parse(string.IsNullOrWhiteSpace(apiAddress) ? "localhost:3242" : apiAddress);
+        var managedLocal = requested.IsDefaultLocal;
+        await ServerLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (managedLocal && _managedServer is { IsRunning: true } existing &&
+                string.Equals(existing.RequestedExePath, viiperExePath, StringComparison.OrdinalIgnoreCase))
+            {
+                var existingApi = new ViiperApiClient(existing.Endpoint);
+                if (await TryPingAsync(existingApi, cancellationToken).ConfigureAwait(false) is not null)
+                {
+                    existing.References++;
+                    trace?.Invoke($"Using this app's managed VIIPER server: pid={existing.Process!.Id}, API={existing.Endpoint}, USBIP=127.0.0.1:{existing.UsbipPort}.");
+                    return new ServerLease(existing);
+                }
+
+                existing.Stop();
+                _managedServer = null;
+            }
+
+            var endpoint = requested;
+            var usbipPort = 3241;
+            PingResponse? ping = null;
+            // A successful ping does not prove that an external server has auto-attach disabled.
+            if (!managedLocal)
+            {
+                ping = await TryPingAsync(new ViiperApiClient(endpoint), cancellationToken).ConfigureAwait(false);
+            }
+
+            Process? process = null;
+            try
+            {
+                if (ping is null)
+                {
+                    var exe = ResolveViiperExe(viiperExePath) ?? throw new FileNotFoundException(
+                        "viiper.exe was not found. Put viiper.exe beside this app or browse to it.");
+                    if (managedLocal)
+                    {
+                        (endpoint, usbipPort) = SelectManagedPorts();
+                        if (endpoint.Port != 3242)
+                        {
+                            trace?.Invoke($"Default VIIPER ports are occupied; leaving the existing service untouched. Managed API={endpoint}, USBIP=127.0.0.1:{usbipPort}.");
+                        }
+                    }
+
+                    process = StartViiperServer(exe, endpoint, usbipPort, trace);
+                    ping = await WaitForPingAsync(new ViiperApiClient(endpoint), TimeSpan.FromSeconds(8), cancellationToken, process, trace).ConfigureAwait(false);
+                }
+
+                if (ping is null)
+                {
+                    throw new InvalidOperationException($"VIIPER API is not reachable at {endpoint}.");
+                }
+
+                if (process is null)
+                {
+                    trace?.Invoke("Using explicitly configured external VIIPER server; its auto-attach setting is not controlled by this app.");
+                }
+
+                var session = new ServerSession(process, endpoint, usbipPort, ping.Version ?? "unknown", viiperExePath);
+                if (managedLocal)
+                {
+                    _managedServer = session;
+                }
+
+                return new ServerLease(session);
+            }
+            catch
+            {
+                if (process is not null)
+                {
+                    TryStopOwnedServer(process);
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            ServerLock.Release();
+        }
+    }
+
+    private static (ViiperEndpoint Endpoint, int UsbipPort) SelectManagedPorts()
+    {
+        for (var apiPort = 3242; apiPort <= 3272; apiPort += 2)
+        {
+            var usbipPort = apiPort - 1;
+            var apiListener = new TcpListener(IPAddress.Loopback, apiPort);
+            var usbipListener = new TcpListener(IPAddress.Loopback, usbipPort);
+            apiListener.ExclusiveAddressUse = true;
+            usbipListener.ExclusiveAddressUse = true;
+            try
+            {
+                apiListener.Start();
+                usbipListener.Start();
+                return (new ViiperEndpoint("127.0.0.1", apiPort), usbipPort);
+            }
+            catch (SocketException)
+            {
+            }
+            finally
+            {
+                apiListener.Stop();
+                usbipListener.Stop();
+            }
+        }
+
+        throw new InvalidOperationException("No free local VIIPER API/USBIP port pair was found in 3241-3272. No existing server was stopped.");
+    }
+
     private static string? ResolveViiperExe(string? explicitPath)
     {
         var candidates = new List<string?>();
@@ -364,12 +446,13 @@ public sealed class ViiperBridge : IAsyncDisposable
     private static Process StartViiperServer(
         string exePath,
         ViiperEndpoint endpoint,
+        int usbipPort,
         Action<string>? trace)
     {
         var info = new ProcessStartInfo
         {
             FileName = exePath,
-            Arguments = $"server --api.addr={endpoint.ListenAddress}",
+            Arguments = $"server --api.addr={endpoint.ListenAddress} --usb.addr=127.0.0.1:{usbipPort} --api.auto-attach-local-client=false --update-notify=none",
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory,
@@ -379,7 +462,7 @@ public sealed class ViiperBridge : IAsyncDisposable
             StandardErrorEncoding = Encoding.UTF8,
         };
         info.Environment[AutoAttachLocalClientEnvironmentVariable] = "false";
-        trace?.Invoke("Starting VIIPER with local auto-attach disabled; this app will attach USBIP manually.");
+        trace?.Invoke($"Starting managed VIIPER with auto-attach and update checks disabled: exe='{exePath}', API={endpoint}, USBIP=127.0.0.1:{usbipPort}. This app will attach USBIP manually.");
         var process = new Process
         {
             StartInfo = info,
@@ -399,15 +482,38 @@ public sealed class ViiperBridge : IAsyncDisposable
                 trace?.Invoke("VIIPER error: " + args.Data);
             }
         };
-        if (!process.Start())
+        try
         {
-            process.Dispose();
-            throw new InvalidOperationException($"Failed to start VIIPER server: {exePath}");
-        }
+            if (!process.Start()) throw new InvalidOperationException($"Failed to start VIIPER server: {exePath}");
+            OwnedServerProcesses.TryAdd(process.Id, process);
 
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-        return process;
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            trace?.Invoke($"Managed VIIPER started: pid={process.Id}.");
+            return process;
+        }
+        catch
+        {
+            TryStopOwnedServer(process);
+            throw;
+        }
+    }
+
+    internal static string DescribeAutoAttachFailure(Exception exception)
+    {
+        var details = exception.Message;
+        var message = exception.ToString();
+        var reason = message.Contains("executable file not found", StringComparison.OrdinalIgnoreCase) ||
+                     message.Contains("not found in %PATH%", StringComparison.OrdinalIgnoreCase)
+            ? "The external VIIPER server cannot find usbip.exe in its process PATH. This is not evidence of a missing driver or an ABI mismatch."
+            : UsbipVirtualController.ClassifyFailure(message) switch
+            {
+                UsbipFailureKind.MultipleVhciInterfaces => "The USBIP driver exposes multiple VHCI host-controller interfaces. This is a controller/driver-instance conflict, not a missing or incompatible usbip.exe.",
+                UsbipFailureKind.AbiMismatch => "The USBIP client reported an ABI mismatch with the installed driver.",
+                _ => "The external VIIPER server's auto-attach operation failed; the exact error is shown below."
+            };
+        return $"VIIPER failed while adding the ns2pro virtual device. {reason} " +
+               $"For an explicitly configured external server, start it with --api.auto-attach-local-client=false and let this app attach USBIP. Details: {details}";
     }
 
 
@@ -446,16 +552,64 @@ public sealed class ViiperBridge : IAsyncDisposable
     {
         try
         {
+            OwnedServerProcesses.TryRemove(process.Id, out _);
             process.CloseMainWindow();
             if (!process.WaitForExit(1000))
             {
                 process.Kill(entireProcessTree: true);
+                process.WaitForExit(1000);
             }
-
-            process.Dispose();
         }
         catch
         {
+        }
+        finally
+        {
+            process.Dispose();
+        }
+    }
+
+    private sealed class ServerSession(
+        Process? process, ViiperEndpoint endpoint, int usbipPort, string version, string? requestedExePath)
+    {
+        private bool _stopped;
+        public Process? Process { get; } = process;
+        public ViiperEndpoint Endpoint { get; } = endpoint;
+        public int UsbipPort { get; } = usbipPort;
+        public string Version { get; } = version;
+        public string? RequestedExePath { get; } = requestedExePath;
+        public int References { get; set; } = 1;
+        public bool IsRunning => !_stopped && Process is { HasExited: false };
+
+        public void Stop()
+        {
+            if (_stopped) return;
+            _stopped = true;
+            if (Process is not null) TryStopOwnedServer(Process);
+        }
+    }
+
+    private sealed class ServerLease(ServerSession session) : IAsyncDisposable
+    {
+        private int _disposed;
+        public ServerSession Session { get; } = session;
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            await ServerLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (--Session.References == 0)
+                {
+                    Session.Stop();
+                    if (ReferenceEquals(_managedServer, Session)) _managedServer = null;
+                }
+            }
+            finally
+            {
+                ServerLock.Release();
+            }
         }
     }
 
@@ -590,6 +744,8 @@ public sealed class ViiperBridge : IAsyncDisposable
                 : host;
         }
 
+        public bool IsDefaultLocal => Port == 3242 && IsLocalHost(Host);
+
         private static bool IsLocalHost(string host) =>
             host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
             host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
@@ -627,12 +783,12 @@ public sealed class ViiperBridge : IAsyncDisposable
 
 public sealed class ViiperServerWarmup : IAsyncDisposable
 {
-    private readonly Process? _ownedServer;
-    private bool _disposed;
+    private readonly Func<ValueTask> _releaseServer;
+    private int _disposed;
 
-    internal ViiperServerWarmup(Process? ownedServer, string description)
+    internal ViiperServerWarmup(Func<ValueTask> releaseServer, string description)
     {
-        _ownedServer = ownedServer;
+        _releaseServer = releaseServer;
         Description = description;
     }
 
@@ -640,28 +796,11 @@ public sealed class ViiperServerWarmup : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return ValueTask.CompletedTask;
         }
 
-        _disposed = true;
-        if (_ownedServer is not null && !_ownedServer.HasExited)
-        {
-            try
-            {
-                _ownedServer.CloseMainWindow();
-                if (!_ownedServer.WaitForExit(1000))
-                {
-                    _ownedServer.Kill(entireProcessTree: true);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        _ownedServer?.Dispose();
-        return ValueTask.CompletedTask;
+        return _releaseServer();
     }
 }

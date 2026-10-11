@@ -37,5 +37,6 @@
 
   <ItemGroup>
     <Compile Remove="launcher\**\*.cs" />
+    <Compile Remove="tests\**\*.cs" />
   </ItemGroup>
 </Project>

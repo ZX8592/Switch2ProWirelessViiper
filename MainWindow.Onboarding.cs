@@ -298,7 +298,7 @@ private void GoPrevStep()
 		}
 		catch (Exception ex)
 		{
-			environment = new UsbipEnvironmentStatus(null, false, ex.Message, false);
+			environment = new UsbipEnvironmentStatus(null, false, ex.Message, false, UsbipFailureKind.ProbeFailed);
 		}
 		if (environment.IsReady)
 		{
@@ -308,9 +308,20 @@ private void GoPrevStep()
 		}
 		else
 		{
-			EnvironmentStatusText.Text = $"{T("usbipMissing")}{Environment.NewLine}{environment.Details}";
+			var issueKey = environment.FailureKind switch
+			{
+				UsbipFailureKind.MultipleVhciInterfaces => "usbipMultipleVhci",
+				UsbipFailureKind.AbiMismatch => "usbipAbiMismatch",
+				UsbipFailureKind.ExecutableNotFound when environment.DriverPackagePresent => "usbipExeMissing",
+				UsbipFailureKind.DriverUnavailable => "usbipVhciUnavailable",
+				UsbipFailureKind.ProbeFailed => "usbipProbeFailed",
+				_ => environment.DriverPackagePresent ? "usbipProbeFailed" : "usbipMissing",
+			};
+			EnvironmentStatusText.Text = $"{T(issueKey)}{Environment.NewLine}{environment.Details}";
 			EnvironmentStatusText.Foreground = ThemeBrush("SystemFillColorCriticalBrush", Windows.UI.Color.FromArgb(byte.MaxValue, 196, 43, 28));
-			OnboardingUsbipButton.Visibility = Visibility.Visible;
+			OnboardingUsbipButton.Visibility = !environment.DriverPackagePresent &&
+				environment.FailureKind is UsbipFailureKind.None or UsbipFailureKind.ExecutableNotFound or UsbipFailureKind.DriverUnavailable
+				? Visibility.Visible : Visibility.Collapsed;
 		}
 	}
 

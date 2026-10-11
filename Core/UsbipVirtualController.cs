@@ -3,24 +3,37 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace Switch2ProWirelessViiper.Core;
+
+public enum UsbipFailureKind
+{
+    None,
+    ExecutableNotFound,
+    MultipleVhciInterfaces,
+    AbiMismatch,
+    DriverUnavailable,
+    ProbeFailed,
+}
 
 public sealed record UsbipEnvironmentStatus(
     string? UsbipExePath,
     bool DriverPackagePresent,
     string Details,
-    bool UsbipExeCompatible)
+    bool UsbipExeCompatible,
+    UsbipFailureKind FailureKind = UsbipFailureKind.None)
 {
-    public bool IsReady => DriverPackagePresent && UsbipExePath is not null && UsbipExeCompatible;
+    public bool IsReady => DriverPackagePresent && UsbipExePath is not null && UsbipExeCompatible && FailureKind == UsbipFailureKind.None;
 }
 
 public static class UsbipVirtualController
 {
     private const string ControllerHardwareId = "VID_057E&PID_2069";
-    private const int ViiperUsbipPort = 3241;
+    private const uint DigcfDeviceInterface = 0x00000010;
+    private const uint DnStarted = 0x00000008;
+    private const uint DnHasProblem = 0x00000400;
     private const uint DigcfPresent = 0x00000002;
-    private const uint DigcfAllClasses = 0x00000004;
     private const int ErrorNoMoreItems = 259;
     private static readonly IntPtr InvalidHandleValue = new(-1);
 
@@ -63,7 +76,8 @@ public static class UsbipVirtualController
             usbipExe,
             driverPresent,
             $"{driverDetails}; {executableDetails}",
-            executable.Compatible);
+            executable.Compatible,
+            executable.FailureKind);
     }
 
     public static async Task<string> EnsureAttachedAsync(
@@ -71,12 +85,15 @@ public static class UsbipVirtualController
         uint busId,
         string deviceId,
         Action<string>? trace,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int usbipPort = 3241,
+        bool allowExistingDevice = true)
     {
-        var instanceId = FindVirtualControllerInstanceId();
-        if (instanceId is not null)
+        var beforeAttach = EnumerateControllerHidInterfaces();
+        var instanceId = beforeAttach.FirstOrDefault(device => device.Ready)?.InstanceId;
+        if (allowExistingDevice && instanceId is not null)
         {
-            trace?.Invoke("Virtual Switch 2 Pro USB device is present: " + instanceId);
+            trace?.Invoke("Virtual Switch 2 Pro game-controller HID interface is ready: " + instanceId);
             return instanceId;
         }
 
@@ -84,38 +101,45 @@ public static class UsbipVirtualController
         trace?.Invoke("USBIP environment: " + environment.Details);
         if (environment.UsbipExePath is null || !environment.UsbipExeCompatible)
         {
-            throw new InvalidOperationException(
-                "VIIPER created the virtual controller, but Windows did not enumerate it. " +
-                "This app disables VIIPER native auto-attach for usbip-win2 compatibility, " +
-                "but a compatible usbip.exe was not found for manual attach. " +
-                environment.Details + " " +
-                "Reinstall usbip-win2, make sure usbip.exe and the driver come from the same version, then reboot Windows.");
+            throw new InvalidOperationException(DescribeEnvironmentFailure(environment));
         }
 
         var exportedBusId = $"{busId}-{deviceId}";
-        trace?.Invoke($"VIIPER auto-attach did not produce a Windows HID device; attaching USBIP bus {exportedBusId} manually.");
+        trace?.Invoke($"Attaching USBIP bus {exportedBusId} manually from {host}:{usbipPort}; waiting for a started game-controller HID interface.");
         var attach = await RunProcessAsync(
                 environment.UsbipExePath,
-                $"--tcp-port {ViiperUsbipPort} attach --remote {host} --bus-id {exportedBusId}",
+                $"--tcp-port {usbipPort} attach --remote {host} --bus-id {exportedBusId}",
                 TimeSpan.FromSeconds(15),
                 cancellationToken)
             .ConfigureAwait(false);
         trace?.Invoke($"usbip attach exited with code {attach.ExitCode}: {attach.Summary}");
         if (attach.ExitCode != 0)
         {
+            ThrowIfKnownDriverFailure(attach);
             trace?.Invoke("Retrying usbip attach with legacy argument order.");
             attach = await RunProcessAsync(
                     environment.UsbipExePath,
-                    $"--tcp-port {ViiperUsbipPort} attach -r {host} --bus-id {exportedBusId}",
+                    $"--tcp-port {usbipPort} attach -r {host} --bus-id {exportedBusId}",
                     TimeSpan.FromSeconds(15),
                     cancellationToken)
                 .ConfigureAwait(false);
             trace?.Invoke($"usbip attach retry exited with code {attach.ExitCode}: {attach.Summary}");
         }
 
+        if (attach.ExitCode != 0)
+        {
+            ThrowIfKnownDriverFailure(attach);
+            throw new InvalidOperationException($"USBIP attach failed with exit code {attach.ExitCode}: {attach.Summary}. No virtual HID readiness was confirmed.");
+        }
+
+        var excludedInterfaces = allowExistingDevice
+            ? null
+            : beforeAttach.Where(device => device.Ready).Select(device => device.InstanceId).ToHashSet(StringComparer.OrdinalIgnoreCase);
         instanceId = await WaitForVirtualControllerAsync(
                 TimeSpan.FromSeconds(10),
-                cancellationToken)
+                cancellationToken,
+                excludedInterfaces,
+                trace)
             .ConfigureAwait(false);
         if (instanceId is null)
         {
@@ -123,43 +147,65 @@ public static class UsbipVirtualController
                 ? string.Empty
                 : " The usbip-win2 driver package was not detected.";
             throw new InvalidOperationException(
-                "VIIPER is running and the ns2pro stream opened, but Windows did not enumerate VID_057E&PID_2069. " +
+                "USBIP attach succeeded, but Windows did not expose a new, started Switch 2 Pro game-controller HID interface. " +
+                "A USB parent node with VID_057E&PID_2069 alone is not sufficient. " +
                 $"usbip attach exit code: {attach.ExitCode}. {attach.Summary}.{driverHint} " +
-                "Reinstall usbip-win2, reboot Windows, and check Device Manager for a USBIP/VHCI error.");
+                "Check the HID child device and its problem code in Device Manager; see HID readiness diagnostics above.");
         }
 
-        trace?.Invoke("Virtual Switch 2 Pro USB device attached: " + instanceId);
+        trace?.Invoke("Virtual Switch 2 Pro game-controller HID interface attached and ready: " + instanceId);
         return instanceId;
     }
 
     public static string? FindVirtualControllerInstanceId()
+        => EnumerateControllerHidInterfaces().FirstOrDefault(device => device.Ready)?.InstanceId;
+
+    private static List<HidInterfaceStatus> EnumerateControllerHidInterfaces()
     {
+        var devices = new List<HidInterfaceStatus>();
+        HidD_GetHidGuid(out var hidGuid);
         var deviceInfoSet = SetupDiGetClassDevs(
-            IntPtr.Zero,
+            ref hidGuid,
             null,
             IntPtr.Zero,
-            DigcfPresent | DigcfAllClasses);
+            DigcfPresent | DigcfDeviceInterface);
         if (deviceInfoSet == InvalidHandleValue)
         {
-            return null;
+            return devices;
         }
 
         try
         {
             for (uint index = 0; ; index++)
             {
-                var deviceInfo = new SpDevInfoData
+                var interfaceData = new SpDeviceInterfaceData
                 {
-                    CbSize = (uint)Marshal.SizeOf<SpDevInfoData>(),
+                    CbSize = (uint)Marshal.SizeOf<SpDeviceInterfaceData>(),
                 };
-                if (!SetupDiEnumDeviceInfo(deviceInfoSet, index, ref deviceInfo))
+                if (!SetupDiEnumDeviceInterfaces(deviceInfoSet, IntPtr.Zero, ref hidGuid, index, ref interfaceData))
                 {
                     if (Marshal.GetLastWin32Error() == ErrorNoMoreItems)
                     {
                         break;
                     }
 
-                    continue;
+                    break;
+                }
+
+                var deviceInfo = new SpDevInfoData { CbSize = (uint)Marshal.SizeOf<SpDevInfoData>() };
+                SetupDiGetDeviceInterfaceDetail(deviceInfoSet, ref interfaceData, IntPtr.Zero, 0, out var requiredSize, ref deviceInfo);
+                if (requiredSize == 0) continue;
+                var detail = Marshal.AllocHGlobal(checked((int)requiredSize));
+                string? devicePath;
+                try
+                {
+                    Marshal.WriteInt32(detail, IntPtr.Size == 8 ? 8 : 6);
+                    if (!SetupDiGetDeviceInterfaceDetail(deviceInfoSet, ref interfaceData, detail, requiredSize, out _, ref deviceInfo)) continue;
+                    devicePath = Marshal.PtrToStringUni(IntPtr.Add(detail, 4));
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(detail);
                 }
 
                 var instanceId = new StringBuilder(512);
@@ -174,10 +220,25 @@ public static class UsbipVirtualController
                 }
 
                 var value = instanceId.ToString();
-                if (value.Contains(ControllerHardwareId, StringComparison.OrdinalIgnoreCase))
+                if (!value.StartsWith("HID\\", StringComparison.OrdinalIgnoreCase) ||
+                    !value.Contains(ControllerHardwareId, StringComparison.OrdinalIgnoreCase) || devicePath is null)
                 {
-                    return value;
+                    continue;
                 }
+
+                var result = CM_Get_DevNode_Status(out var status, out var problem, deviceInfo.DevInst, 0);
+                var ready = false;
+                var reason = $"device status query failed: CR=0x{result:X}";
+                if (result == 0)
+                {
+                    reason = $"status=0x{status:X}, problem={problem}";
+                    if (IsStartedControllerHid(value, status, problem))
+                    {
+                        ready = ProbeControllerHid(devicePath, out reason);
+                    }
+                }
+
+                devices.Add(new HidInterfaceStatus(value, ready, reason));
             }
         }
         finally
@@ -185,27 +246,82 @@ public static class UsbipVirtualController
             SetupDiDestroyDeviceInfoList(deviceInfoSet);
         }
 
-        return null;
+        return devices;
     }
+
+    private static bool ProbeControllerHid(string devicePath, out string details)
+    {
+        using var handle = CreateFile(devicePath, 0, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            details = $"HID interface open failed: Win32={Marshal.GetLastWin32Error()}";
+            return false;
+        }
+
+        var attributes = new HidAttributes { Size = (uint)Marshal.SizeOf<HidAttributes>() };
+        if (!HidD_GetAttributes(handle, ref attributes) || attributes.VendorId != 0x057E || attributes.ProductId != 0x2069)
+        {
+            details = "HID attributes unavailable or VID/PID mismatch";
+            return false;
+        }
+
+        if (!HidD_GetPreparsedData(handle, out var preparsed))
+        {
+            details = $"HID report descriptor unavailable: Win32={Marshal.GetLastWin32Error()}";
+            return false;
+        }
+
+        try
+        {
+            var capsResult = HidP_GetCaps(preparsed, out var caps);
+            details = $"HID caps: status=0x{capsResult:X8}, usagePage=0x{caps.UsagePage:X}, usage=0x{caps.Usage:X}, inputReportBytes={caps.InputReportByteLength}";
+            return capsResult == 0x00110000 && IsGameControllerReport(caps.UsagePage, caps.Usage, caps.InputReportByteLength);
+        }
+        finally
+        {
+            HidD_FreePreparsedData(preparsed);
+        }
+    }
+
+    internal static bool IsGameControllerReport(ushort usagePage, ushort usage, ushort inputReportBytes)
+        => usagePage == 0x01 && usage is 0x04 or 0x05 && inputReportBytes > 1;
+
+    internal static bool IsStartedControllerHid(string instanceId, uint status, uint problem)
+        => instanceId.StartsWith("HID\\", StringComparison.OrdinalIgnoreCase) &&
+           instanceId.Contains(ControllerHardwareId, StringComparison.OrdinalIgnoreCase) &&
+           (status & DnStarted) != 0 && (status & DnHasProblem) == 0 && problem == 0;
 
     private static async Task<string?> WaitForVirtualControllerAsync(
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ISet<string>? excludedInterfaces,
+        Action<string>? trace)
     {
         var deadline = DateTimeOffset.UtcNow.Add(timeout);
+        string? lastDiagnostics = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var instanceId = FindVirtualControllerInstanceId();
+            var interfaces = EnumerateControllerHidInterfaces();
+            var instanceId = interfaces.FirstOrDefault(device => device.Ready && excludedInterfaces?.Contains(device.InstanceId) != true)?.InstanceId;
             if (instanceId is not null)
             {
                 return instanceId;
             }
 
+            var diagnostics = interfaces.Count == 0
+                ? "No matching HID interface is present (a matching USB parent alone is not ready)."
+                : string.Join("; ", interfaces.Select(device => $"{device.InstanceId}: ready={device.Ready}, preExisting={excludedInterfaces?.Contains(device.InstanceId) == true}, {device.Details}"));
+            if (diagnostics != lastDiagnostics)
+            {
+                trace?.Invoke("HID readiness: " + diagnostics);
+                lastDiagnostics = diagnostics;
+            }
+
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
 
-        return FindVirtualControllerInstanceId();
+        return EnumerateControllerHidInterfaces().FirstOrDefault(device => device.Ready && excludedInterfaces?.Contains(device.InstanceId) != true)?.InstanceId;
     }
 
     private static bool IsUsbipDriverServiceRegistered()
@@ -249,10 +365,10 @@ public static class UsbipVirtualController
 
         if (candidates.Length == 0)
         {
-            return new UsbipExecutableProbe(null, false, "usbip.exe was not found; manual USBIP attach is unavailable");
+            return new UsbipExecutableProbe(null, false, "usbip.exe was not found; manual USBIP attach is unavailable", UsbipFailureKind.ExecutableNotFound);
         }
 
-        var rejected = new List<string>();
+        var rejected = new List<UsbipExecutableProbe>();
         foreach (var candidate in candidates)
         {
             var probe = await ProbeUsbipExeAsync(candidate, cancellationToken).ConfigureAwait(false);
@@ -261,19 +377,27 @@ public static class UsbipVirtualController
                 return probe;
             }
 
-            rejected.Add(probe.Details);
+            rejected.Add(probe);
         }
 
-        var details = string.Join("; ", rejected.Take(5));
+        var details = string.Join("; ", rejected.Take(5).Select(probe => probe.Details));
         if (rejected.Count > 5)
         {
             details += $"; {rejected.Count - 5} more candidate(s) skipped";
         }
 
+        var failureKind = rejected.Any(probe => probe.FailureKind == UsbipFailureKind.MultipleVhciInterfaces)
+            ? UsbipFailureKind.MultipleVhciInterfaces
+            : rejected.All(probe => probe.FailureKind == UsbipFailureKind.AbiMismatch)
+                ? UsbipFailureKind.AbiMismatch
+                : rejected.All(probe => probe.FailureKind == UsbipFailureKind.DriverUnavailable)
+                    ? UsbipFailureKind.DriverUnavailable
+                    : UsbipFailureKind.ProbeFailed;
         return new UsbipExecutableProbe(
-            null,
+            candidates[0],
             false,
-            "No compatible usbip.exe was found. " + details);
+            "usbip.exe was found, but no candidate passed the client/driver probe. " + details,
+            failureKind);
     }
 
     private static async Task<UsbipExecutableProbe> ProbeUsbipExeAsync(
@@ -295,14 +419,63 @@ public static class UsbipVirtualController
                 return new UsbipExecutableProbe(path, true, $"{description}, ABI check passed");
             }
 
-            var reason = summary.Contains("ABI mismatch", StringComparison.OrdinalIgnoreCase)
+            var failure = ClassifyFailure(result.CombinedOutput);
+            var reason = failure == UsbipFailureKind.AbiMismatch
                 ? "ABI mismatch with installed usbip-win2 driver"
                 : $"probe exited with code {result.ExitCode}: {summary}";
-            return new UsbipExecutableProbe(null, false, $"{description}, skipped: {reason}");
+            return new UsbipExecutableProbe(path, false, $"{description}, {reason}", failure);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            return new UsbipExecutableProbe(null, false, $"{description}, skipped: probe failed: {DescribeException(ex)}");
+            return new UsbipExecutableProbe(path, false, $"{description}, probe failed: {DescribeException(ex)}", UsbipFailureKind.ProbeFailed);
+        }
+    }
+
+    internal static UsbipFailureKind ClassifyFailure(string message)
+    {
+        if (message.Contains("Multiple instances of VHCI device interface", StringComparison.OrdinalIgnoreCase))
+            return UsbipFailureKind.MultipleVhciInterfaces;
+        if (message.Contains("ABI mismatch", StringComparison.OrdinalIgnoreCase))
+            return UsbipFailureKind.AbiMismatch;
+        if (message.Contains("VHCI device interface not found", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("No VHCI device interface", StringComparison.OrdinalIgnoreCase))
+            return UsbipFailureKind.DriverUnavailable;
+        if (message.Contains("executable file not found", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("not found in %PATH%", StringComparison.OrdinalIgnoreCase))
+            return UsbipFailureKind.ExecutableNotFound;
+        return UsbipFailureKind.ProbeFailed;
+    }
+
+    internal static string DescribeEnvironmentFailure(UsbipEnvironmentStatus environment)
+    {
+        var reason = environment.FailureKind switch
+        {
+            UsbipFailureKind.MultipleVhciInterfaces =>
+                "Multiple USBIP VHCI host-controller interfaces were found. usbip.exe exists, but the client cannot select a unique host controller. " +
+                "Check for duplicate active USBIP host-controller instances in Device Manager. Changing usbip.exe versions is not the indicated fix.",
+            UsbipFailureKind.ExecutableNotFound =>
+                "usbip.exe was not found in the app folder, registered install locations, or PATH. Locate the installed client executable; this does not by itself mean the driver is missing.",
+            UsbipFailureKind.AbiMismatch =>
+                "The USBIP client explicitly reported an ABI mismatch with the installed driver. Use a client and driver from the same usbip-win2 release.",
+            UsbipFailureKind.DriverUnavailable =>
+                "usbip.exe was found, but no active VHCI host-controller interface was found. Check the driver's active device and problem code in Device Manager.",
+            _ =>
+                "usbip.exe was found, but its client/driver probe failed. Compatibility is unconfirmed; the probe's actual error is shown below."
+        };
+        return $"VIIPER virtual output could not be attached. {reason} Details: {environment.Details}";
+    }
+
+    private static void ThrowIfKnownDriverFailure(ProcessResult result)
+    {
+        var failure = ClassifyFailure(result.CombinedOutput);
+        if (failure is UsbipFailureKind.MultipleVhciInterfaces or UsbipFailureKind.AbiMismatch or UsbipFailureKind.DriverUnavailable)
+        {
+            throw new InvalidOperationException(DescribeEnvironmentFailure(
+                new UsbipEnvironmentStatus(null, true, result.CombinedOutput, false, failure)));
         }
     }
 
@@ -462,9 +635,10 @@ public static class UsbipVirtualController
         {
             await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             try { process.Kill(entireProcessTree: true); } catch { }
+            cancellationToken.ThrowIfCancellationRequested();
             throw new TimeoutException($"{Path.GetFileName(fileName)} timed out after {timeout.TotalSeconds:0} seconds.");
         }
 
@@ -476,7 +650,10 @@ public static class UsbipVirtualController
     private static string DescribeException(Exception exception) =>
         $"{exception.Message} (HRESULT 0x{exception.HResult:X8})";
 
-    private sealed record UsbipExecutableProbe(string? Path, bool Compatible, string Details);
+    private sealed record UsbipExecutableProbe(string? Path, bool Compatible, string Details,
+        UsbipFailureKind FailureKind = UsbipFailureKind.None);
+
+    private sealed record HidInterfaceStatus(string InstanceId, bool Ready, string Details);
 
     private sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError)
     {
@@ -503,19 +680,82 @@ public static class UsbipVirtualController
         public UIntPtr Reserved;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SpDeviceInterfaceData
+    {
+        public uint CbSize;
+        public Guid InterfaceClassGuid;
+        public uint Flags;
+        public UIntPtr Reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HidAttributes
+    {
+        public uint Size;
+        public ushort VendorId;
+        public ushort ProductId;
+        public ushort VersionNumber;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    private struct HidCaps
+    {
+        [FieldOffset(0)] public ushort Usage;
+        [FieldOffset(2)] public ushort UsagePage;
+        [FieldOffset(4)] public ushort InputReportByteLength;
+    }
+
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr SetupDiGetClassDevs(
-        IntPtr classGuid,
+        ref Guid classGuid,
         string? enumerator,
         IntPtr hwndParent,
         uint flags);
 
     [DllImport("setupapi.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetupDiEnumDeviceInfo(
+    private static extern bool SetupDiEnumDeviceInterfaces(
         IntPtr deviceInfoSet,
+        IntPtr deviceInfoData,
+        ref Guid interfaceClassGuid,
         uint memberIndex,
+        ref SpDeviceInterfaceData deviceInterfaceData);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetupDiGetDeviceInterfaceDetail(
+        IntPtr deviceInfoSet,
+        ref SpDeviceInterfaceData deviceInterfaceData,
+        IntPtr detailData,
+        uint detailDataSize,
+        out uint requiredSize,
         ref SpDevInfoData deviceInfoData);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern uint CM_Get_DevNode_Status(out uint status, out uint problemNumber, uint devInst, uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(string fileName, uint desiredAccess, uint shareMode,
+        IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+    [DllImport("hid.dll")]
+    private static extern void HidD_GetHidGuid(out Guid hidGuid);
+
+    [DllImport("hid.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool HidD_GetAttributes(SafeFileHandle device, ref HidAttributes attributes);
+
+    [DllImport("hid.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool HidD_GetPreparsedData(SafeFileHandle device, out IntPtr preparsedData);
+
+    [DllImport("hid.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool HidD_FreePreparsedData(IntPtr preparsedData);
+
+    [DllImport("hid.dll")]
+    private static extern int HidP_GetCaps(IntPtr preparsedData, out HidCaps capabilities);
 
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\Core\ViiperBridge.cs" Link="Core\ViiperBridge.cs" />
+    <Compile Include="..\..\Core\UsbipVirtualController.cs" Link="Core\UsbipVirtualController.cs" />
+    <Compile Include="..\..\Core\ViiperNs2ProWire.cs" Link="Core\ViiperNs2ProWire.cs" />
+    <Compile Include="..\..\Core\Switch2State.cs" Link="Core\Switch2State.cs" />
+  </ItemGroup>
+</Project>
